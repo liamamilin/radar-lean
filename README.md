@@ -61,5 +61,5 @@ macOS 原生信息雷达：自然语言建立关注 → 发现并试读信息源
 - **测试**：38 个（4 个联网类默认跳过）。
 
 **真实限制（请知悉）**：
-- **系统通知横幅未能验证**：本机上 `app.radar.Radar` 每次启动 `requestAuthorization` 都返回 `UNErrorDomain Code=1 "Notifications are not allowed"`（启动后延迟请求、ad-hoc 签名均相同，系统通知设置里也没有看到授权弹窗）。这是 macOS 层面的拒绝而非通知提交逻辑报错，但未能据此确认原因；请在 系统设置 → 通知 里查找 Radar 并允许，然后重试。点击通知打开链接同样未验证。
+- **系统通知**：在 系统设置 → 通知 里允许 Radar 后，授权通过，本地 feed 的新文章通知已送达通知中心（已截图确认）。首次未允许时 `requestAuthorization` 返回 “Notifications are not allowed”，菜单栏会提示去系统设置。横幅的瞬时显示与点击通知打开链接尚未验证。
 - 不做 JS 渲染页面、超过 90 天的老项目走红、LLM 判断；质量规则是启发式，会有误判。
