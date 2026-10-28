@@ -24,5 +24,6 @@ cat > "$APP/Contents/Info.plist" <<PL
 </dict></plist>
 PL
 for b in "$(dirname "$BIN")"/*.bundle; do case "$b" in *Tests*) ;; *) cp -R "$b" "$APP/Contents/Resources/";; esac; done
-codesign --force --deep --sign - "$APP"
+# A stable identity keeps the Keychain "Always Allow" valid across rebuilds; ad-hoc (-) changes it every build.
+codesign --force --deep --sign "${RADAR_SIGN_IDENTITY:--}" "$APP"
 echo "Built $APP"
