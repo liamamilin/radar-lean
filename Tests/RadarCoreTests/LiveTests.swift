@@ -119,7 +119,37 @@ final class ScenarioTests: XCTestCase {
         print("SCENARIO added:", r.added.map { $0.spec.name }, "stale:", r.stale)
         XCTAssertGreaterThan(try store.sync { try Source.fetchCount($0) }, before - 1)
         let post = await engine.check(watchID: w.id!)
-        XCTAssertTrue(post.allSatisfy { !Keywords.matches($0.title + $0.reason, any: ["rag"]) || true })
         print("SCENARIO post-edit events:", post.count)
+    }
+}
+
+/// Real GitHub twice, minutes apart: metrics of known projects must follow reality, and a repo that really crosses the bar alerts once.
+final class RecheckTests: XCTestCase {
+    func testRealMetricsMoveAndCrossingAlerts() async throws {
+        let env = ProcessInfo.processInfo.environment
+        try XCTSkipUnless(env["RADAR_RECHECK"] == "1")
+        let store = try Store(path: nil)
+        let fetcher = Fetcher(githubToken: { env["GITHUB_TOKEN"] })
+        let engine = Engine(store: store, fetcher: fetcher)
+        let first = try await fetcher.fetchSearch("topic:ai-agents", cond: [:]).entries
+        let stars = first.compactMap { Int($0.meta["stars"] ?? "") }.filter { $0 >= 60 }
+        // bar chosen where the most repos sit just below it, so real growth has something to cross
+        let bar = (stars.min()!...stars.max()!).max { a, b in stars.filter { $0 < a && $0 >= a - 15 }.count < stars.filter { $0 < b && $0 >= b - 15 }.count }!
+        print("RECHECK bar", bar, "repos just below:", stars.filter { $0 < bar && $0 >= bar - 15 }.count)
+        var plan = WatchPlan(type: .topic, title: "t"); plan.minStars = bar
+        let w = try store.createWatch(plan: plan, text: "t", sources: [SourceSpec(kind: .githubSearch, endpoint: "topic:ai-agents", name: "gh")])
+        var evs = await engine.check(watchID: w.id!)
+        XCTAssertEqual(evs.count, 0)
+        let before = Dictionary(uniqueKeysWithValues: try store.sync { try Entry.fetchAll($0) }.map { ($0.title, Int($0.meta["stars"] ?? "") ?? 0) })
+        try await Task.sleep(nanoseconds: UInt64((Double(env["RADAR_RECHECK_WAIT"] ?? "300") ?? 300) * 1e9))
+        try await store.db.write { try $0.execute(sql: "UPDATE source SET nextDueAt = ?", arguments: [Date()]) }
+        evs = await engine.check(watchID: w.id!)
+        let after = Dictionary(uniqueKeysWithValues: try store.sync { try Entry.fetchAll($0) }.map { ($0.title, Int($0.meta["stars"] ?? "") ?? 0) })
+        let moved = after.filter { before[$0.key] != nil && before[$0.key]! != $0.value }
+        print("RECHECK tracked", before.count, "→", after.count, "| stars changed on", moved.count, "| new repos", after.count - before.count)
+        for (k, v) in moved.sorted(by: { $0.value - before[$0.key]! > $1.value - before[$1.key]! }).prefix(8) { print("RECHECK  \(k): ★\(before[k]!) → ★\(v)") }
+        for e in evs { print("RECHECK event [\(e.kind)] \(e.title) — \(e.reason) — \(e.evidenceURL)") }
+        XCTAssertGreaterThan(moved.count, 0, "no star count moved in the wait")                 // metrics really are refreshed
+        again: do { let r = await engine.check(watchID: w.id!); XCTAssertEqual(r.count, 0) }    // and an immediate re-check stays quiet
     }
 }

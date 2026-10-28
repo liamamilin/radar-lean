@@ -35,11 +35,24 @@ public enum RadarError: LocalizedError {
     }
 }
 
+/// Spaces out GitHub search calls (10/min without a token, 30/min with one) so a burst never trips the limit.
+actor Throttle {
+    var next = Date.distantPast
+    func wait(_ gap: TimeInterval) async {
+        let now = Date(), at = max(now, next)
+        next = at.addingTimeInterval(gap)
+        if at > now { try? await Task.sleep(nanoseconds: UInt64(at.timeIntervalSince(now) * 1e9)) }
+    }
+}
+
 public final class Fetcher {
+    let searchGate = Throttle()
+    public var searchGap: TimeInterval?    // nil = by GitHub's limits; tests set 0
     public var session: URLSession
     public var githubToken: () -> String?
     public var searchKey: () -> String?
     public var searchEndpoint = "https://api.exa.ai/search"
+    public var githubBase = "https://api.github.com"   // overridable for local end-to-end runs
 
     public init(session: URLSession? = nil, githubToken: @escaping () -> String? = { nil }, searchKey: @escaping () -> String? = { nil }) {
         if let session { self.session = session } else {
@@ -106,7 +119,7 @@ public final class Fetcher {
     static let iso: ISO8601DateFormatter = { let f = ISO8601DateFormatter(); return f }()
 
     func fetchReleases(_ repo: String, cond: [String: String]) async throws -> FetchResult {
-        let url = URL(string: "https://api.github.com/repos/\(repo)/releases?per_page=30")!
+        let url = URL(string: "\(githubBase)/repos/\(repo)/releases?per_page=30")!
         let r = try await get(url, headers: githubHeaders().merging(cond) { $1 })
         if r.status == 304 { return FetchResult(entries: [], notModified: true, etag: cond["If-None-Match"], lastModified: cond["If-Modified-Since"]) }
         try check(r, allow304: true)
@@ -125,25 +138,33 @@ public final class Fetcher {
         return FetchResult(entries: entries, etag: r.headers["etag"], title: repo)
     }
 
-    /// Two windows, merged: established-but-new repos (90 days, 30+ stars) and very fresh fast risers (14 days, 5+ stars),
-    /// so a brand-new project is seen long before it could reach the top of a 90-day star ranking.
+    /// Three star bands over recent creation dates, merged: fresh risers (14 days, 5+ stars), the middle band (90 days, 30–400 stars)
+    /// and the top band (90 days, 400+). One ranking by stars would be filled by mega-projects and hide everything in the middle.
     func fetchSearch(_ query: String, cond: [String: String]) async throws -> FetchResult {
         var seen = Set<Int>(), entries: [FetchedEntry] = []
-        for (days, minStars, perPage) in [(90, 30, 100), (14, 5, 50)] {
-            for e in try await searchRepos(query, days: days, minStars: minStars, perPage: perPage) where seen.insert(Int(e.externalKey) ?? 0).inserted {
+        for (days, stars) in [(14, ">=5"), (90, "30..400"), (90, ">400")] {
+            for e in try await searchRepos(query, days: days, stars: stars, perPage: 100) where seen.insert(Int(e.externalKey) ?? 0).inserted {
                 entries.append(e)
             }
         }
         return FetchResult(entries: entries, title: query)
     }
 
-    func searchRepos(_ query: String, days: Int, minStars: Int, perPage: Int) async throws -> [FetchedEntry] {
+    /// One cheap query, enough to tell a candidate source works and show samples.
+    public func sampleSearch(_ query: String) async throws -> FetchResult {
+        FetchResult(entries: try await searchRepos(query, days: 90, stars: "30..400", perPage: 20), title: query)
+    }
+
+    func searchRepos(_ query: String, days: Int, stars: String, perPage: Int) async throws -> [FetchedEntry] {
         let df = DateFormatter(); df.dateFormat = "yyyy-MM-dd"; df.timeZone = TimeZone(identifier: "UTC")
         let since = df.string(from: Date().addingTimeInterval(-Double(days) * 86400))
-        var c = URLComponents(string: "https://api.github.com/search/repositories")!
-        c.queryItems = [URLQueryItem(name: "q", value: "\(query) created:>=\(since) stars:>=\(minStars) fork:false archived:false"),
+        var c = URLComponents(string: "\(githubBase)/search/repositories")!
+        c.queryItems = [URLQueryItem(name: "q", value: "\(query) created:>=\(since) stars:\(stars) fork:false archived:false"),
                         URLQueryItem(name: "sort", value: "stars"), URLQueryItem(name: "order", value: "desc"),
                         URLQueryItem(name: "per_page", value: String(perPage))]
+        if githubBase == "https://api.github.com" {
+            await searchGate.wait(searchGap ?? ((githubToken() ?? "").isEmpty ? 6.5 : 2.1))
+        }
         let r = try await get(c.url!, headers: githubHeaders(), maxBytes: 8_000_000)   // no conditional: query window moves daily
         try check(r, allow304: false)
         guard let o = try JSONSerialization.jsonObject(with: r.data) as? [String: Any], let items = o["items"] as? [[String: Any]]

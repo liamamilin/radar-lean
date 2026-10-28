@@ -32,7 +32,8 @@ class Base: XCTestCase {
         let cfg = URLSessionConfiguration.ephemeral
         cfg.protocolClasses = [Stub.self]
         store = try Store(path: nil)
-        engine = Engine(store: store, fetcher: Fetcher(session: URLSession(configuration: cfg)))
+        let fetcher = Fetcher(session: URLSession(configuration: cfg)); fetcher.searchGap = 0
+        engine = Engine(store: store, fetcher: fetcher)
     }
     func events() throws -> [Event] { try store.sync { try Event.fetchAll($0) } }
     func watch(_ plan: WatchPlan, _ spec: SourceSpec) throws -> (Watch, Source) {
@@ -295,7 +296,7 @@ final class JudgeTests: Base {
         var plan = WatchPlan(type: .topic, title: "ai"); plan.include = ["agent"]
         let (_, s) = try watch(plan, SourceSpec(kind: .githubSearch, endpoint: "topic:ai-agents", name: "gh"))
         func item(_ id: Int, _ name: String, _ stars: Int, _ age: Double, _ desc: String, fork: Bool = false) -> String {
-            #"{"id":\#(id),"full_name":"\#(name)","html_url":"https://github.com/\#(name)","description":"\#(desc)","stargazers_count":\#(stars),"forks_count":1,"language":"Python","topics":[],"created_at":"\#(ago(age))","pushed_at":"\#(ago(1))","fork":\#(fork),"archived":false}"#
+            #"{"id":\#(id),"full_name":"\#(name)","html_url":"https://github.com/\#(name)","description":"\#(desc)","stargazers_count":\#(stars),"forks_count":30,"language":"Python","topics":[],"created_at":"\#(ago(age))","pushed_at":"\#(ago(1))","fork":\#(fork),"archived":false}"#
         }
         Stub.routes[searchURL] = .init(body: Data(#"{"items":[]}"#.utf8))
         var o = await engine.check(sourceID: s.id!)
@@ -370,5 +371,132 @@ final class JudgeTests: Base {
         Stub.routes[Self.relURL] = .init(body: Data("[\(rel(3)),\(rel(2)),\(rel(1))]".utf8))
         o = await engine.check(sourceID: s.id!)
         XCTAssertEqual(o.events.map { $0.title }, ["v1.3.0"])  // resumed: only what is new since, not the paused backlog
+    }
+}
+
+final class RegressionTests: Base {
+    let searchURL = "https://api.github.com/search/repositories"
+    func ago(_ days: Double) -> String { Fetcher.iso.string(from: Date().addingTimeInterval(-days * 86400)) }
+    func repo(_ id: Int, _ name: String, stars: Int, age: Double = 20, desc: String = "An agent framework for tools", forks: Int? = nil) -> String {
+        #"{"id":\#(id),"full_name":"\#(name)","html_url":"https://github.com/\#(name)","description":"\#(desc)","stargazers_count":\#(stars),"forks_count":\#(forks ?? max(1, stars / 10)),"language":"Go","topics":[],"created_at":"\#(ago(age))","pushed_at":"\#(ago(0))","fork":false,"archived":false}"#
+    }
+    func serve(_ repos: [String]) { Stub.routes[searchURL] = .init(body: Data(#"{"items":[\#(repos.joined(separator: ","))]}"#.utf8)) }
+    let ghSpec = SourceSpec(kind: .githubSearch, endpoint: "topic:ai-agents", name: "gh")
+
+    // same page title, new content each time: every real change is an event, a repeat check is not
+    func testSameTitlePageChangesAllReported() async throws {
+        func page(_ body: String) -> Data { Data("<html><head><title>Pricing</title></head><body><article>\(body) plan details for everyone</article></body></html>".utf8) }
+        let (_, s) = try watch(WatchPlan(type: .webpage, title: "p"), SourceSpec(kind: .web, endpoint: "https://p.test/page", name: "page"))
+        Stub.routes["https://p.test/page"] = .init(body: page("Starter costs 10 dollars"))
+        _ = await engine.check(sourceID: s.id!)
+        Stub.routes["https://p.test/page"] = .init(body: page("Starter costs 12 dollars"))
+        var o = await engine.check(sourceID: s.id!); XCTAssertEqual(o.events.count, 1)
+        Stub.routes["https://p.test/page"] = .init(body: page("Starter costs 15 dollars"))
+        o = await engine.check(sourceID: s.id!); XCTAssertEqual(o.events.count, 1)          // same title as the first event, still new
+        o = await engine.check(sourceID: s.id!); XCTAssertEqual(o.events.count, 0)
+        XCTAssertEqual(try events().count, 2)
+        XCTAssertEqual(Set(try events().map { $0.afterSnippet ?? "" }).count, 2)
+    }
+
+    func testSameTitleSameSourceNotMerged_OtherSourceMerged() async throws {
+        func feed(_ items: [(String, String)]) -> Data {
+            Data(("<?xml version=\"1.0\"?><rss version=\"2.0\"><channel><title>t</title>" + items.map { "<item><title>\($0.0)</title><link>\($0.1)</link></item>" }.joined() + "</channel></rss>").utf8)
+        }
+        let t = "Big agent runtime launch today"
+        let (w, a) = try watch(WatchPlan(type: .topic, title: "x"), SourceSpec(kind: .rss, endpoint: "https://a.test/feed", name: "A"))
+        let b = try store.attach(watchID: w.id!, spec: SourceSpec(kind: .rss, endpoint: "https://b.test/feed", name: "B"))
+        Stub.routes["https://a.test/feed"] = .init(body: feed([("old a", "https://a.test/0")])); Stub.routes["https://b.test/feed"] = .init(body: feed([("old b", "https://b.test/0")]))
+        _ = await engine.check(sourceID: a.id!); _ = await engine.check(sourceID: b.id!)
+        Stub.routes["https://a.test/feed"] = .init(body: feed([(t, "https://a.test/1"), ("old a", "https://a.test/0")]))
+        Stub.routes["https://b.test/feed"] = .init(body: feed([(t, "https://b.test/9"), ("old b", "https://b.test/0")]))
+        do { let c = await engine.check(sourceID: a.id!).events.count; XCTAssertEqual(c, 1) }
+        do { let c = await engine.check(sourceID: b.id!).events.count; XCTAssertEqual(c, 0) }               // other source, same story: merged
+        XCTAssertEqual(try events()[0].evidence.count, 2)
+        // the same source reusing a title for a different link is a different item
+        Stub.routes["https://a.test/feed"] = .init(body: feed([(t, "https://a.test/2"), (t, "https://a.test/1"), ("old a", "https://a.test/0")]))
+        do { let c = await engine.check(sourceID: a.id!).events.count; XCTAssertEqual(c, 1) }
+    }
+
+    // 12 → 300 stars: found once; further growth and unchanged checks stay quiet; each watch uses its own bar
+    func testStarThresholdCrossing() async throws {
+        var p1 = WatchPlan(type: .topic, title: "low"); p1.minStars = 100; p1.include = ["agent"]
+        var p2 = WatchPlan(type: .topic, title: "high"); p2.minStars = 500; p2.include = ["agent"]
+        let (w1, s) = try watch(p1, ghSpec)
+        let w2 = try store.createWatch(plan: p2, text: "t", sources: [])
+        _ = try store.attach(watchID: w2.id!, spec: ghSpec)
+        serve([repo(1, "o/rocket", stars: 12), repo(2, "o/steady", stars: 40), repo(3, "o/already", stars: 400)])
+        var o = await engine.check(sourceID: s.id!)
+        XCTAssertEqual(o.events.count, 0)                                                   // baseline: nothing, even o/already
+        serve([repo(1, "o/rocket", stars: 300), repo(2, "o/steady", stars: 60), repo(3, "o/already", stars: 450)])
+        o = await engine.check(sourceID: s.id!)
+        XCTAssertEqual(o.events.map { "\($0.watchID):\($0.title)" }, ["\(w1.id!):o/rocket"])  // 300 ≥ 100 yes, ≥ 500 no; steady 60 < 100; already was above before
+        XCTAssertTrue(o.events[0].reason.contains("★12 → ★300"))
+        serve([repo(1, "o/rocket", stars: 320), repo(2, "o/steady", stars: 60), repo(3, "o/already", stars: 450)])
+        do { let c = await engine.check(sourceID: s.id!).events.count; XCTAssertEqual(c, 0) }               // no repeat for the same bar
+        serve([repo(1, "o/rocket", stars: 700), repo(2, "o/steady", stars: 60), repo(3, "o/already", stars: 450)])
+        let hi = await engine.check(sourceID: s.id!)
+        XCTAssertEqual(hi.events.map { $0.watchID }, [w2.id!])                              // crosses the high watch's bar once
+        XCTAssertEqual(try store.sync { try Entry.fetchOne($0, sql: "SELECT * FROM entry WHERE title = 'o/rocket'")?.meta["stars"] }, "700")   // metrics kept current
+    }
+
+    func testNotificationRule() {
+        var topic = WatchPlan(type: .topic, title: "t")
+        for k in ["newProject", "majorUpdate"] { XCTAssertTrue(Engine.shouldNotify(plan: topic, kind: k)) }
+        for k in ["update", "pageChange"] { XCTAssertFalse(Engine.shouldNotify(plan: topic, kind: k)) }
+        XCTAssertTrue(Engine.shouldNotify(plan: WatchPlan(type: .feed, title: "f"), kind: "update"))   // single-feed watch: its articles are the point
+        topic.notify = false
+        XCTAssertFalse(Engine.shouldNotify(plan: topic, kind: "newProject"))                           // user's switch wins
+    }
+
+    // "排除 RAG" typed after the fact must filter what arrives next
+    func testNaturalLanguageExcludeTakesEffect() async throws {
+        var plan = WatchPlan(type: .topic, title: "t"); plan.include = ["agent"]; plan.minStars = 10
+        let (w, s) = try watch(plan, ghSpec)
+        serve([])
+        _ = await engine.check(sourceID: s.id!)
+        let edited = try XCTUnwrap(PlanParser.applyEdit("也关注 MCP，排除 RAG", to: plan))
+        try await store.db.write { var x = try Watch.fetchOne($0, key: w.id!)!; x.plan = edited; try x.update($0) }
+        serve([repo(1, "o/ragbot", stars: 80, desc: "Agent with RAG pipeline over docs"), repo(2, "o/mcpkit", stars: 80, desc: "MCP server toolkit"),
+               repo(3, "o/runner", stars: 80, desc: "Agent runtime for tools"), repo(4, "o/mgmt", stars: 80, desc: "Project management dashboard")])
+        let o = await engine.check(sourceID: s.id!)
+        XCTAssertEqual(o.events.map { $0.title }.sorted(), ["o/mcpkit", "o/runner"])         // RAG out, MCP in, "management" is not "agent"
+    }
+
+    func testKeywordMatching() {
+        XCTAssertTrue(Keywords.matches("Agentic workflows", any: ["agent"]))
+        XCTAssertFalse(Keywords.matches("Project management suite", any: ["agent"]))
+        XCTAssertFalse(Keywords.matches("a paint tool", any: ["ai"]))
+        XCTAssertTrue(Keywords.matches("topics: local-llm ollama", any: ["本地模型"]))
+        XCTAssertFalse(Keywords.matches("Local news and weather", any: ["本地模型"]))
+    }
+
+    // an article linking a project we already reported adds evidence, not a second alert
+    func testArticleAboutKnownRepoMerges() async throws {
+        var plan = WatchPlan(type: .topic, title: "t"); plan.include = ["agent"]; plan.minStars = 10
+        let (w, g) = try watch(plan, ghSpec)
+        let blog = try store.attach(watchID: w.id!, spec: SourceSpec(kind: .rss, endpoint: "https://blog.test/feed", name: "blog"))
+        serve([]); Stub.routes["https://blog.test/feed"] = .init(body: Data("<?xml version=\"1.0\"?><rss version=\"2.0\"><channel><title>t</title></channel></rss>".utf8))
+        _ = await engine.check(sourceID: g.id!); _ = await engine.check(sourceID: blog.id!)
+        serve([repo(1, "o/newagent", stars: 80)])
+        do { let c = await engine.check(sourceID: g.id!).events.count; XCTAssertEqual(c, 1) }
+        Stub.routes["https://blog.test/feed"] = .init(body: Data("<?xml version=\"1.0\"?><rss version=\"2.0\"><channel><title>t</title><item><title>Meet newagent, a fresh agent runtime</title><link>https://blog.test/p1</link><description>Code at https://github.com/o/newagent today</description></item></channel></rss>".utf8))
+        do { let c = await engine.check(sourceID: blog.id!).events.count; XCTAssertEqual(c, 0) }
+        XCTAssertEqual(try events().count, 1); XCTAssertEqual(try events()[0].evidence.count, 2)
+    }
+
+    // project-quality rules on real-looking metadata: tag-only matches, inflated stars
+    func testGitHubQualityRules() {
+        var plan = WatchPlan(type: .topic, title: "t"); plan.include = ["MCP"]
+        func verdict(_ title: String, _ desc: String, topics: String, stars: Int, forks: Int) -> Bool {
+            let e = Entry(id: 1, sourceID: 1, externalKey: "1", canonicalURL: "https://github.com/\(title)", title: title, summary: desc, text: "", contentHash: "",
+                          firstSeenAt: Date(), publishedAt: Date().addingTimeInterval(-20 * 86400),
+                          meta: ["stars": "\(stars)", "forks": "\(forks)", "topics": topics])
+            return Engine.evaluate(plan: plan, kind: .githubSearch, entry: e, change: .new) != nil
+        }
+        XCTAssertTrue(verdict("a/srv", "MCP server for GitHub issues", topics: "mcp", stars: 300, forks: 30))
+        XCTAssertTrue(verdict("a/agentkit", "Toolkit for LLM agents", topics: "mcp,agents", stars: 300, forks: 30))   // tag + reads as AI work
+        XCTAssertFalse(verdict("a/cad", "Parametric 3D CAD in Rust", topics: "mcp,cad", stars: 5000, forks: 400))     // tag only, not AI
+        XCTAssertFalse(verdict("a/farm", "MCP server for everything", topics: "mcp", stars: 1200, forks: 5))          // 1200 stars, 5 forks
+        XCTAssertFalse(verdict("a/empty", "", topics: "mcp", stars: 300, forks: 30))
     }
 }

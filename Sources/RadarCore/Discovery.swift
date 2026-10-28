@@ -125,7 +125,7 @@ public final class Discovery {
     public func probe(_ spec: SourceSpec, include: [String] = []) async -> Candidate {
         let existing = (try? await store.db.read { try Source.filter(Column("uniqueKey") == spec.uniqueKey).fetchCount($0) })?.advanced(by: 0) ?? 0
         do {
-            let r = try await fetcher.fetch(spec)
+            let r = spec.kind == .githubSearch ? try await fetcher.sampleSearch(spec.endpoint) : try await fetcher.fetch(spec)
             if r.entries.isEmpty && spec.kind != .githubReleases { throw RadarError.parse("没有读到任何内容") }
             let hits = include.isEmpty ? nil : r.entries.filter { Keywords.matches($0.title + " " + $0.summary, any: include) }.count
             return Candidate(spec: spec, ok: true, title: r.title, samples: spec.kind == .web ? [String(r.entries[0].summary.prefix(240))] : r.entries.prefix(4).map { $0.title }, error: nil, existing: existing > 0,
@@ -136,7 +136,7 @@ public final class Discovery {
     }
 
     /// The topic changed: attach good new sources (no backfill), and report attached ones that no longer fit the keywords.
-    public func rediscover(watchID: Int64, plan: WatchPlan, text: String) async -> (added: [Candidate], stale: [String]) {
+    public func rediscover(watchID: Int64, plan: WatchPlan, text: String) async -> (added: [Candidate], stale: [String], errors: [String]) {
         let current = (try? await store.db.read { try Source.fetchAll($0, sql: "SELECT source.* FROM source JOIN watchSource ws ON ws.sourceID = source.id WHERE ws.watchID = ?", arguments: [watchID]) }) ?? []
         let have = Set(current.map { $0.uniqueKey })
         let cands = await findSources(plan: plan, text: text + " " + plan.include.joined(separator: " "))
@@ -147,7 +147,7 @@ public final class Discovery {
             let c = await probe(SourceSpec(kind: s.kind, endpoint: s.endpoint, name: s.name), include: plan.include)
             if c.ok, c.total > 0, c.matched == 0 { stale.append(s.name) }
         }
-        return (fresh, stale)
+        return (fresh, stale, cands.filter { !$0.ok && !have.contains($0.spec.uniqueKey) }.compactMap { $0.error }.prefix(2).map { $0 })
     }
 
     public func findSources(plan: WatchPlan, text: String) async -> [Candidate] {

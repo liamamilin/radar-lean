@@ -185,16 +185,25 @@ public enum Keywords {
         "ai 绘画": ["stable diffusion", "image generation", "text-to-image", "midjourney", "comfyui", "ai art", "diffusion"],
         "ai绘画": ["stable diffusion", "image generation", "text-to-image", "midjourney", "comfyui", "ai art", "diffusion"],
         "绘画": ["stable diffusion", "image generation", "text-to-image", "ai art", "diffusion"],
-        "本地模型": ["local", "llm", "ollama", "gguf", "llama", "on-device", "offline"],
-        "本地大模型": ["local", "llm", "ollama", "gguf", "llama", "on-device", "offline"],
+        "本地模型": ["local llm", "local model", "locally", "on-device", "on device", "ollama", "gguf", "llama.cpp", "lm studio", "mlx", "offline llm", "self-hosted llm"],
+        "本地大模型": ["local llm", "local model", "locally", "on-device", "on device", "ollama", "gguf", "llama.cpp", "lm studio", "mlx", "offline llm", "self-hosted llm"],
         "智能体": ["agent"], "代理": ["agent"],
+        "agent": ["agentic", "claude code", "codex", "harness"], "agents": ["agentic", "claude code", "codex", "harness"],
+        "mcp": ["model context protocol"],
     ]
     public static func expand(_ k: String) -> [String] {
         let l = k.lowercased().trimmingCharacters(in: .whitespaces)
         return [l] + (aliases[l] ?? [])
     }
+    /// ASCII terms match at a word start ("agent" hits "agents"/"agentic", not "management"); terms of 3 letters or fewer must be whole words.
+    /// Hyphens/underscores count as spaces, so the topic "local-llm" matches "local llm".
     public static func matches(_ text: String, any list: [String]) -> Bool {
-        let t = text.lowercased()
-        return list.contains { expand($0).contains { t.contains($0) } }
+        let t = text.lowercased().replacingOccurrences(of: "-", with: " ").replacingOccurrences(of: "_", with: " ")
+        return list.contains { expand($0).contains { term in
+            let term = term.replacingOccurrences(of: "-", with: " ")
+            guard term.allSatisfy(\.isASCII) else { return t.contains(term) }
+            let pat = "(?<![a-z0-9])" + NSRegularExpression.escapedPattern(for: term) + (term.count <= 3 ? "(?![a-z0-9])" : "")
+            return t.range(of: pat, options: .regularExpression) != nil
+        } }
     }
 }

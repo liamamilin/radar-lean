@@ -16,7 +16,7 @@ public final class Engine {
 
     public init(store: Store, fetcher: Fetcher) { self.store = store; self.fetcher = fetcher }
 
-    enum Change { case new, changed(before: String) }
+    enum Change { case new, changed(before: String), metrics(previous: [String: String]) }
 
     /// Fetch a source once and serve every linked watch from the result.
     @discardableResult
@@ -68,6 +68,12 @@ public final class Engine {
                     e.contentHash = h; e.text = fe.text; e.summary = fe.summary; e.title = fe.title
                     try e.update(db)
                     changes.append((e, .changed(before: before)))
+                } else if src.kind == .githubSearch {
+                    // an already-known project: keep its stars/forks current, and let rules see the move
+                    let prev = e.meta
+                    e.meta = fe.meta; e.summary = fe.summary; e.title = fe.title
+                    try e.update(db)
+                    if prev["stars"] != fe.meta["stars"] { changes.append((e, .metrics(previous: prev))) }
                 }
             } else {
                 var e = Entry(id: nil, sourceID: sourceID, externalKey: fe.externalKey, canonicalURL: fe.url, title: fe.title,
@@ -87,12 +93,26 @@ public final class Engine {
                 guard let w = try Watch.fetchOne(db, key: link.watchID), w.isActive else { continue }
                 for (entry, change) in changes {
                     guard let j = Self.evaluate(plan: w.plan, kind: src.kind, entry: entry, change: change, previous: prevVersion) else { continue }
-                    let type: String; if case .new = change { type = "new" } else { type = "changed" }
+                    let type: String
+                    switch change { case .new: type = "new"; case .changed: type = "changed"; case .metrics: type = "metrics" }
                     var mk = mergeKey(entry.canonicalURL)
                     if type == "changed" { mk += "#" + entry.contentHash }
+                    let rk = Self.repoKey(entry, kind: src.kind)
                     let ref = EvidenceRef(name: src.name, url: entry.canonicalURL)
-                    // Same content already reported for this watch (another source, same link/repo/title): add evidence, no new event.
-                    if var old = try Event.filter(Column("watchID") == w.id! && (Column("mergeKey") == mk || (entry.title.count >= 15 && Column("title") == entry.title))).fetchOne(db) {
+                    // Already reported for this watch: same link / same GitHub project (within a week) / same title from another source
+                    // within 3 days. Add the evidence, no new event. A different version of the same page is NOT a duplicate (mk has its hash).
+                    let wid = w.id!
+                    var old = try Event.filter(Column("watchID") == wid && Column("mergeKey") == mk).fetchOne(db)
+                    if old == nil && !rk.isEmpty {
+                        old = try Event.filter(Column("watchID") == wid && (Column("mergeKey") == rk || Column("repoKey") == rk)
+                                               && Column("createdAt") > Date().addingTimeInterval(-7 * 86400)).fetchOne(db)
+                    }
+                    if old == nil && type == "new" && entry.title.count >= 15 {
+                        old = try Event.filter(Column("watchID") == wid && Column("title") == entry.title && Column("kind") != "pageChange"
+                                               && Column("createdAt") > Date().addingTimeInterval(-3 * 86400)).fetchAll(db)
+                            .first { !$0.evidence.contains { $0.name == src.name } }
+                    }
+                    if var old {
                         var ev = old.evidence
                         if !ev.contains(ref) { ev.append(ref); old.evidence = ev }
                         if Self.rank(j.kind) > Self.rank(old.kind) { old.kind = j.kind; old.reason = j.reason }
@@ -101,7 +121,7 @@ public final class Engine {
                     }
                     var ev = Event(id: nil, watchID: w.id!, entryID: entry.id!, dedupeKey: sha256("\(w.id!)|\(mk)|\(type)"), title: entry.title, reason: j.reason,
                                    evidenceURL: entry.canonicalURL, beforeSnippet: j.before, afterSnippet: j.after, createdAt: Date(), readAt: nil,
-                                   kind: j.kind, mergeKey: mk)
+                                   kind: j.kind, mergeKey: mk, repoKey: rk)
                     ev.evidence = [ref]
                     try ev.insert(db)
                     events.append(ev)
@@ -112,13 +132,34 @@ public final class Engine {
         src.nextDueAt = Date().addingTimeInterval(src.intervalSeconds)
         if let e = result.etag { src.etag = e }; if let m = result.lastModified { src.lastModified = m }
         try src.update(db)
-        return (events, changes.count)
+        return (events, changes.filter { if case .new = $0.1 { return true }; return false }.count)
     }
 
     struct Judged { var reason: String; var kind: String; var before: String? = nil; var after: String? = nil }
 
+    /// Topic watches interrupt only for new projects and major updates; everything else waits in the list.
+    public static func shouldNotify(plan: WatchPlan, kind: String) -> Bool {
+        plan.notify && (plan.type != .topic || kind == "newProject" || kind == "majorUpdate")
+    }
+
+    static let ghReserved: Set<String> = ["topics", "orgs", "sponsors", "features", "marketplace", "about", "login", "settings", "collections", "explore", "trending", "apps", "enterprise", "pricing", "readme"]
+    /// The GitHub project an entry is (a repo page) or links to (first repo URL in its text).
+    static func repoKey(_ e: Entry, kind: SourceKind) -> String {
+        let k = mergeKey(e.canonicalURL)
+        if k.hasPrefix("gh:") { return k }
+        guard kind == .rss || kind == .list else { return "" }   // release notes link to their own repo; each release stays its own event
+        let hay = String((e.summary + " " + e.text).prefix(3000))   // not the URL itself: a release page must not collapse into its repo
+        guard let r = hay.range(of: #"github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)"#, options: .regularExpression) else { return "" }
+        let parts = hay[r].dropFirst("github.com/".count).split(separator: "/")
+        guard parts.count == 2, !ghReserved.contains(parts[0].lowercased()) else { return "" }
+        var repo = String(parts[1]); while repo.hasSuffix(".") { repo.removeLast() }; if repo.hasSuffix(".git") { repo.removeLast(4) }
+        return "gh:" + (parts[0] + "/" + repo).lowercased()
+    }
+
     static func rank(_ kind: String) -> Int { ["update": 0, "pageChange": 1, "majorUpdate": 2, "newProject": 3][kind] ?? 0 }
 
+    static let aiHints = ["ai", "llm", "llms", "gpt", "model", "models", "inference", "agent", "agents", "mcp", "claude", "codex", "qwen", "deepseek", "ollama", "gpu",
+                          "模型", "大模型", "智能体", "人工智能"]
     static let majorWords = ["release", "released", "launch", "introducing", "announcing", "announce", "open source", "open-source", "v1", "1.0", "2.0",
                              "发布", "上线", "重磅", "全新", "正式版", "major"]
 
@@ -149,14 +190,27 @@ public final class Engine {
             if !pre, let have, let previous { major = have.nums[0] > previous.nums[0] || (have.nums[0] == previous.nums[0] && have.nums[1] > previous.nums[1]) }
             return Judged(reason: "新\(pre ? "预发布" : "正式版")：\(tag)" + (major ? "（主要/次要版本升级）" : ""), kind: major ? "majorUpdate" : "update")
         case .githubSearch:
-            guard relevant(hay) else { return nil }
+            // Relevance rests on what the project says about itself (name + description). A topic tag alone is easy to add
+            // (CAD apps and UI kits tagged "mcp"), so a tag-only match must at least read as AI work.
+            let said = entry.title + " " + entry.summary, topics = (entry.meta["topics"] ?? "").replacingOccurrences(of: ",", with: " ")
+            let wanted = plan.include.isEmpty || Keywords.matches(said, any: plan.include)
+                || (Keywords.matches(topics, any: plan.include) && Keywords.matches(said, any: aiHints))
+            guard wanted, plan.exclude.isEmpty || !Keywords.matches(said + " " + topics, any: plan.exclude) else { return nil }
             let stars = Int(entry.meta["stars"] ?? "") ?? 0
             let age = Date().timeIntervalSince(entry.publishedAt ?? entry.firstSeenAt) / 86400
             guard worthAlert(stars: stars, ageDays: age, minStars: plan.minStars) else { return nil }
+            // a known project only alerts when it crosses this watch's bar now (it was below it before)
+            var rising: Int?
+            if case .metrics(let prev) = change {
+                let was = Int(prev["stars"] ?? "") ?? 0
+                guard !worthAlert(stars: was, ageDays: age, minStars: plan.minStars) else { return nil }
+                rising = was
+            } else if case .changed = change { return nil }
             // cheap sanity: a real project says what it is, and a pile of stars with zero forks is usually inflated
             let forks = Int(entry.meta["forks"] ?? "") ?? 0
-            guard entry.summary.count >= 10, !(stars >= 20 && forks == 0) else { return nil }
+            guard entry.summary.count >= 10, !(stars >= 200 && forks * 100 < stars), !(stars >= 20 && forks == 0) else { return nil }
             let lang = entry.meta["language"].flatMap { $0.isEmpty ? nil : " · " + $0 } ?? ""
+            if let was = rising { return Judged(reason: "项目升温 · ★\(was) → ★\(stars) · 创建 \(Int(age)) 天\(lang)", kind: "newProject") }
             return Judged(reason: "新项目 · 创建 \(Int(age)) 天 · ★\(stars)\(lang)", kind: "newProject")
         case .rss, .list:
             guard relevant(hay) else { return nil }

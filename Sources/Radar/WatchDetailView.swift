@@ -168,10 +168,11 @@ struct WatchDetailView: View {
     func rediscover() async {
         model.checking += 1; defer { model.checking -= 1 }
         nlMessage = "关注目标变了，正在重新发现来源…"
-        let (fresh, stale) = await model.discovery.rediscover(watchID: watchID, plan: plan, text: watch?.originalText ?? "")
+        let (fresh, stale, errors) = await model.discovery.rediscover(watchID: watchID, plan: plan, text: watch?.originalText ?? "")
         var parts: [String] = []
         parts.append(fresh.isEmpty ? "没有找到新的合适来源" : "新增来源：" + fresh.map { $0.spec.name }.joined(separator: "、") + "（只记录基线，不补报历史）")
         if !stale.isEmpty { parts.append("这些来源近期没有含新关键词的内容，可用来源右侧的 − 移除：" + stale.joined(separator: "、")) }
+        if !errors.isEmpty { parts.append("有候选来源读取失败：" + errors.joined(separator: "；")) }
         nlMessage = parts.joined(separator: "。")
         await model.check(watchID: watchID)
     }

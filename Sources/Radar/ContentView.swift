@@ -94,11 +94,21 @@ struct ContentView: View {
         let wid = watches[0].id!
         let w0 = watches[0]; model.setStatus(w0, active: false); try? await Task.sleep(nanoseconds: 1_500_000_000); Self.snapshot(dir + "/2-paused.png")
         model.setStatus(w0, active: true); try? await Task.sleep(nanoseconds: 1_000_000_000)
-        try? await model.store.db.write { db in
-            try db.execute(sql: "DELETE FROM entry WHERE id IN (SELECT id FROM (SELECT id, ROW_NUMBER() OVER (PARTITION BY sourceID ORDER BY COALESCE(publishedAt, firstSeenAt) DESC) r FROM entry) WHERE r <= 5)")
-            try db.execute(sql: "UPDATE source SET etag = NULL, lastModified = NULL")
+        // real incremental: wait, then re-read the real sources and compare what GitHub now says
+        func stars() async -> [String: Int] {
+            let es = (try? await model.store.db.read { try Entry.fetchAll($0) }) ?? []
+            return Dictionary(es.map { ($0.canonicalURL, Int($0.meta["stars"] ?? "") ?? 0) }, uniquingKeysWith: { a, _ in a })
         }
-        await model.check(watchID: wid); await settle()
+        var guardT = 0
+        while ((try? await model.store.db.read { try Entry.fetchCount($0) }) ?? 0) == 0 && guardT < 120 { try? await Task.sleep(nanoseconds: 1_000_000_000); guardT += 1 }
+        await settle()
+        let s0 = await stars(); let e0 = (try? await model.store.db.read { try Event.fetchCount($0) }) ?? 0
+        let wait = Double(env["RADAR_DRIVE_WAIT"] ?? "180") ?? 180
+        log("waiting \(Int(wait))s for the real sources to move")
+        try? await Task.sleep(nanoseconds: UInt64(wait * 1e9))
+        await model.checkDue(force: true); await settle()
+        let s1 = await stars(); let e1 = (try? await model.store.db.read { try Event.fetchCount($0) }) ?? 0
+        log("repos \(s0.count) -> \(s1.count), stars changed on \(s1.filter { s0[$0.key] != nil && s0[$0.key]! != $0.value }.count), events \(e0) -> \(e1)")
         selection = .updates; try? await Task.sleep(nanoseconds: 2_000_000_000); Self.snapshot(dir + "/3-updates.png")
         selection = .watch(wid); try? await Task.sleep(nanoseconds: 1_500_000_000)
         let before = (try? await model.store.db.read { try Source.fetchCount($0) }) ?? 0

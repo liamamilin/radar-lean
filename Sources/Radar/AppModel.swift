@@ -40,6 +40,7 @@ final class AppModel: NSObject, ObservableObject, UNUserNotificationCenterDelega
     private var timer: Timer?
 
     override init() {
+        let isolated = ProcessInfo.processInfo.environment["RADAR_DB"] != nil   // a scratch database never touches the real Keychain
         let path = ProcessInfo.processInfo.environment["RADAR_DB"] ?? ((try? Store.defaultPath()) ?? ":memory:")
         store = try! Store(path: path)
         let tokenBox = TokenBox()
@@ -48,9 +49,9 @@ final class AppModel: NSObject, ObservableObject, UNUserNotificationCenterDelega
         engine = Engine(store: store, fetcher: fetcher)
         discovery = Discovery(fetcher: fetcher, store: store)
         super.init()
-        tokenBox.value = ProcessInfo.processInfo.environment["GITHUB_TOKEN"] ?? Keychain.get()
+        tokenBox.value = ProcessInfo.processInfo.environment["GITHUB_TOKEN"] ?? (isolated ? nil : Keychain.get())
         self.tokenBox = tokenBox
-        searchBox.value = ProcessInfo.processInfo.environment["EXA_API_KEY"] ?? Keychain.get(Keychain.searchService)
+        searchBox.value = ProcessInfo.processInfo.environment["EXA_API_KEY"] ?? (isolated ? nil : Keychain.get(Keychain.searchService))
         self.searchBox = searchBox
         observer = DatabaseRegionObservation(tracking: Watch.all(), Source.all(), Event.all(), Entry.all(), WatchSource.all())
             .start(in: store.db, onError: { _ in }, onChange: { [weak self] _ in
@@ -98,9 +99,7 @@ final class AppModel: NSObject, ObservableObject, UNUserNotificationCenterDelega
     func notify(_ events: [Event]) {
         let watches = (try? store.db.read { try Watch.fetchAll($0) }) ?? []
         for e in events {
-            guard let plan = watches.first(where: { $0.id == e.watchID })?.plan, plan.notify else { continue }
-            // topic watches only interrupt for new projects / major updates; ordinary posts stay in the list
-            if plan.type == .topic && e.kind == "update" { continue }
+            guard let plan = watches.first(where: { $0.id == e.watchID })?.plan, Engine.shouldNotify(plan: plan, kind: e.kind) else { continue }
             let c = UNMutableNotificationContent()
             c.title = e.title; c.body = e.reason; c.userInfo = ["url": e.evidenceURL]
             UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: e.dedupeKey, content: c, trigger: nil))
