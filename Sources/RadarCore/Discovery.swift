@@ -30,6 +30,8 @@ public final class Discovery {
                 SourceSpec(kind: .githubSearch, endpoint: "topic:ai-agents", name: "GitHub · AI Agent 新项目", interval: 12 * 3600),
                 SourceSpec(kind: .githubSearch, endpoint: "topic:local-llm", name: "GitHub · 本地 LLM 新项目", interval: 12 * 3600),
                 SourceSpec(kind: .githubSearch, endpoint: "topic:llm", name: "GitHub · LLM 新项目", interval: 12 * 3600),
+                SourceSpec(kind: .githubSearch, endpoint: "topic:ollama", name: "GitHub · Ollama 生态新项目", interval: 12 * 3600),
+                SourceSpec(kind: .githubSearch, endpoint: "topic:mcp", name: "GitHub · MCP 新项目", interval: 12 * 3600),
               ])
     ]
 
@@ -48,6 +50,7 @@ public final class Discovery {
                 if s.isFeed { out.append(SourceSpec(kind: .rss, endpoint: u, name: URL(string: u)?.host ?? u)) }
                 else {
                     for l in s.feedLinks { out.append(SourceSpec(kind: .rss, endpoint: l, name: (URL(string: l)?.host ?? l) + " Feed")) }
+                    if let l = await fetcher.findList(starting: [u]) { out.append(SourceSpec(kind: .list, endpoint: l, name: (URL(string: u)?.host ?? u) + " 列表")) }
                     out.append(SourceSpec(kind: .web, endpoint: u, name: s.title ?? (URL(string: u)?.host ?? u)))
                 }
             } else {
@@ -71,8 +74,10 @@ public final class Discovery {
             let inc = plan.include.joined(separator: " ").lowercased()
             let wantAgent = inc.contains("agent") || inc.contains("智能体")
             let wantLocal = inc.contains("local") || inc.contains("本地")
+            let wantMCP = inc.contains("mcp")
             var picks = topic.candidates.filter {
                 ($0.endpoint == "topic:ai-agents" && wantAgent) || ($0.endpoint == "topic:local-llm" && wantLocal)
+                    || ($0.endpoint == "topic:ollama" && wantLocal) || ($0.endpoint == "topic:mcp" && wantMCP)
             }
             if picks.isEmpty { picks = [topic.candidates.first { $0.endpoint == "topic:llm" }!] }
             return picks
@@ -105,6 +110,8 @@ public final class Discovery {
                         if s.isFeed { return (i, SourceSpec(kind: .rss, endpoint: t, name: host)) }
                         if let l = s.feedLinks.first { return (i, SourceSpec(kind: .rss, endpoint: l, name: host + " Feed")) }
                     }
+                    // no feed: a listing page we can read item by item
+                    if let l = await fetcher.findList(starting: tries.reversed()) { return (i, SourceSpec(kind: .list, endpoint: l, name: host + " 列表")) }
                     return nil
                 }
             }
@@ -128,17 +135,38 @@ public final class Discovery {
         }
     }
 
+    /// The topic changed: attach good new sources (no backfill), and report attached ones that no longer fit the keywords.
+    public func rediscover(watchID: Int64, plan: WatchPlan, text: String) async -> (added: [Candidate], stale: [String]) {
+        let current = (try? await store.db.read { try Source.fetchAll($0, sql: "SELECT source.* FROM source JOIN watchSource ws ON ws.sourceID = source.id WHERE ws.watchID = ?", arguments: [watchID]) }) ?? []
+        let have = Set(current.map { $0.uniqueKey })
+        let cands = await findSources(plan: plan, text: text + " " + plan.include.joined(separator: " "))
+        let fresh = Array(cands.filter { $0.ok && !have.contains($0.spec.uniqueKey) && ($0.matched ?? 1) > 0 }.prefix(3))
+        for c in fresh { _ = try? store.attach(watchID: watchID, spec: c.spec) }
+        var stale: [String] = []
+        for s in current where s.kind == .rss || s.kind == .list {
+            let c = await probe(SourceSpec(kind: s.kind, endpoint: s.endpoint, name: s.name), include: plan.include)
+            if c.ok, c.total > 0, c.matched == 0 { stale.append(s.name) }
+        }
+        return (fresh, stale)
+    }
+
     public func findSources(plan: WatchPlan, text: String) async -> [Candidate] {
-        var out: [Candidate] = []
-        for s in await specs(for: plan, text: text) { out.append(await probe(s)) }
+        // probe in parallel (keeps order); a slow site no longer holds up the others
+        func probeAll(_ list: [SourceSpec], include: [String]) async -> [Candidate] {
+            await withTaskGroup(of: (Int, Candidate).self) { g in
+                for (i, s) in list.enumerated() { g.addTask { (i, await self.probe(s, include: include)) } }
+                var r: [(Int, Candidate)] = []
+                for await x in g { r.append(x) }
+                return r.sorted { $0.0 < $1.0 }.map { $0.1 }
+            }
+        }
+        async let webSpecs: [SourceSpec] = plan.type == .topic ? searchSpecs(plan: plan, text: text) : []   // overlaps with the GitHub probes
+        var out = await probeAll(await specs(for: plan, text: text), include: [])
         guard plan.type == .topic else { return out }
         // Web-searched sites: probe, drop dead/stale feeds, rank by keyword hits then freshness.
-        var found: [Candidate] = []
-        for s in await searchSpecs(plan: plan, text: text) where !out.contains(where: { $0.spec.uniqueKey == s.uniqueKey }) {
-            let c = await probe(s, include: plan.include)
-            if c.ok, let l = c.latest, l < Date().addingTimeInterval(-365 * 86400) { continue }
-            found.append(c)
-        }
+        let searched = await webSpecs.filter { s in !out.contains(where: { $0.spec.uniqueKey == s.uniqueKey }) }
+        var found: [Candidate] = await probeAll(searched, include: plan.include)
+        found.removeAll { c in if c.ok, let l = c.latest, l < Date().addingTimeInterval(-365 * 86400) { return true }; return false }
         found.sort { ($0.matched ?? 0, $0.latest ?? .distantPast) > ($1.matched ?? 0, $1.latest ?? .distantPast) }
         out += found
         return out

@@ -45,15 +45,7 @@ struct ContentView: View {
             // Dev aid: RADAR_SNAPSHOT=<dir> writes PNGs of the window (updates view, then first watch) and quits.
             guard let dir = ProcessInfo.processInfo.environment["RADAR_SNAPSHOT"] else { return }
             try? await Task.sleep(nanoseconds: 6_000_000_000)
-            func shot(_ name: String) {
-                guard let win = NSApp.windows.first(where: { $0.isVisible && !$0.isSheet && $0.frame.width > 600 }),
-                      let v = win.contentView?.superview ?? win.contentView else { return }
-                let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: Int(v.bounds.width * 2), pixelsHigh: Int(v.bounds.height * 2),
-                                           bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0)!
-                rep.size = v.bounds.size
-                v.cacheDisplay(in: v.bounds, to: rep)
-                try? rep.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: dir + "/" + name))
-            }
+            func shot(_ name: String) { Self.snapshot(dir + "/" + name) }
             try? NSApp.windows.map { "\($0.title) \($0.frame) vis=\($0.isVisible) sheet=\($0.isSheet) \(type(of: $0))" }.joined(separator: "\n").write(toFile: dir + "/windows.txt", atomically: true, encoding: .utf8)
             shot("updates.png")
             if let w = watches.first?.id { selection = .watch(w); try? await Task.sleep(nanoseconds: 2_000_000_000); shot("watch.png") }
@@ -64,9 +56,61 @@ struct ContentView: View {
             }
             NSApp.terminate(nil)
         }
+        .task { await drive() }
         .task(id: model.revision) {
             watches = (try? await model.store.db.read { try Watch.order(Column("createdAt").desc).fetchAll($0) }) ?? []
         }
+    }
+
+    static func snapshot(_ path: String) {
+        guard let win = NSApp.windows.first(where: { $0.isVisible && !$0.isSheet && $0.frame.width > 600 }),
+              let v = win.contentView?.superview ?? win.contentView else { return }
+        let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: Int(v.bounds.width * 2), pixelsHigh: Int(v.bounds.height * 2),
+                                   bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0)!
+        rep.size = v.bounds.size
+        v.cacheDisplay(in: v.bounds, to: rep)
+        try? rep.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: path))
+    }
+
+    /// Dev aid: RADAR_DRIVE_DIR + RADAR_DRIVE_TEXT (+ RADAR_DRIVE_NL) runs the real flow in the running app —
+    /// create a watch from the sentence, check, pause/resume, fake an incremental update, edit by natural language — with a PNG at each stage.
+    func drive() async {
+        let env = ProcessInfo.processInfo.environment
+        guard let dir = env["RADAR_DRIVE_DIR"], let text = env["RADAR_DRIVE_TEXT"] else { return }
+        func log(_ s: String) { print("DRIVE", s); FileHandle.standardError.write(Data(("DRIVE " + s + "\n").utf8)) }
+        func settle(_ max: Double = 240) async {
+            try? await Task.sleep(nanoseconds: 2_000_000_000)
+            var t = 0.0
+            while model.checking > 0 && t < max { try? await Task.sleep(nanoseconds: 1_000_000_000); t += 1 }
+            try? await Task.sleep(nanoseconds: 1_500_000_000)
+        }
+        try? await Task.sleep(nanoseconds: 4_000_000_000)
+        showNew = true
+        var t = 0
+        while watches.isEmpty && t < 240 { try? await Task.sleep(nanoseconds: 1_000_000_000); t += 1 }      // NewWatchView analyses and creates by itself
+        log("watch created after \(t)s")
+        try? await Task.sleep(nanoseconds: 1_000_000_000)
+        await settle(); Self.snapshot(dir + "/1-created.png")
+        let wid = watches[0].id!
+        let w0 = watches[0]; model.setStatus(w0, active: false); try? await Task.sleep(nanoseconds: 1_500_000_000); Self.snapshot(dir + "/2-paused.png")
+        model.setStatus(w0, active: true); try? await Task.sleep(nanoseconds: 1_000_000_000)
+        try? await model.store.db.write { db in
+            try db.execute(sql: "DELETE FROM entry WHERE id IN (SELECT id FROM (SELECT id, ROW_NUMBER() OVER (PARTITION BY sourceID ORDER BY COALESCE(publishedAt, firstSeenAt) DESC) r FROM entry) WHERE r <= 5)")
+            try db.execute(sql: "UPDATE source SET etag = NULL, lastModified = NULL")
+        }
+        await model.check(watchID: wid); await settle()
+        selection = .updates; try? await Task.sleep(nanoseconds: 2_000_000_000); Self.snapshot(dir + "/3-updates.png")
+        selection = .watch(wid); try? await Task.sleep(nanoseconds: 1_500_000_000)
+        let before = (try? await model.store.db.read { try Source.fetchCount($0) }) ?? 0
+        if let nl = env["RADAR_DRIVE_NL"] { model.driveNL = nl }
+        try? await Task.sleep(nanoseconds: 3_000_000_000)
+        await settle(300)
+        let after = (try? await model.store.db.read { try Source.fetchCount($0) }) ?? 0
+        log("sources \(before) -> \(after) after natural-language edit")
+        Self.snapshot(dir + "/4-after-edit.png")
+        let evs = (try? await model.store.db.read { try Event.fetchCount($0) }) ?? 0
+        log("events \(evs)")
+        exit(0)
     }
 
     func icon(_ w: Watch) -> String {
@@ -81,13 +125,19 @@ struct ContentView: View {
 }
 
 struct EventRow: View {
+    static func badge(_ kind: String) -> (String, Color)? {
+        switch kind { case "newProject": return ("新项目", .green); case "majorUpdate": return ("重大更新", .orange); case "pageChange": return ("页面变化", .blue); default: return nil }
+    }
     let event: Event
     var watchTitle: String?
     var body: some View {
         HStack(alignment: .top, spacing: 10) {
             Circle().fill(event.readAt == nil ? Color.accentColor : .clear).frame(width: 8, height: 8).padding(.top, 6)
             VStack(alignment: .leading, spacing: 3) {
-                Text(event.title).font(.headline)
+                HStack(spacing: 6) {
+                    if let b = Self.badge(event.kind) { Text(b.0).font(.caption2.bold()).padding(.horizontal, 6).padding(.vertical, 1).background(b.1.opacity(0.2), in: Capsule()).foregroundStyle(b.1) }
+                    Text(event.title).font(.headline)
+                }
                 Text(event.reason).foregroundStyle(.secondary)
                 if let b = event.beforeSnippet, let a = event.afterSnippet {
                     Text("前：\(b)").font(.caption).foregroundStyle(.secondary).lineLimit(3)
@@ -98,6 +148,9 @@ struct EventRow: View {
                     Text(event.createdAt.formatted(.relative(presentation: .named)))
                     Link(event.evidenceURL, destination: URL(string: event.evidenceURL) ?? URL(string: "about:blank")!).lineLimit(1)
                 }.font(.caption).foregroundStyle(.secondary)
+                if event.evidence.count > 1 {
+                    Text("同一内容的 \(event.evidence.count) 个来源：" + event.evidence.map { $0.name }.joined(separator: "、")).font(.caption).foregroundStyle(.secondary)
+                }
             }
         }.padding(.vertical, 3)
     }

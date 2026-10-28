@@ -55,6 +55,11 @@ public final class Engine {
         var src = try Source.fetchOne(db, key: sourceID)!
         let wasInitialized = src.initialized
         var changes: [(Entry, Change)] = []
+        var prevVersion: Version?
+        if src.kind == .githubReleases {
+            let seen = try Entry.filter(Column("sourceID") == sourceID).fetchAll(db)
+            prevVersion = seen.filter { $0.meta["prerelease"] != "1" && $0.meta["draft"] != "1" }.compactMap { Version($0.meta["tag"] ?? $0.title) }.max()
+        }
         for fe in result.entries {
             if var e = try Entry.filter(Column("sourceID") == sourceID && Column("externalKey") == fe.externalKey).fetchOne(db) {
                 let h = fe.contentHash
@@ -81,15 +86,25 @@ public final class Engine {
             for link in links {
                 guard let w = try Watch.fetchOne(db, key: link.watchID), w.isActive else { continue }
                 for (entry, change) in changes {
-                    guard let (reason, before, after) = Self.evaluate(plan: w.plan, kind: src.kind, entry: entry, change: change) else { continue }
+                    guard let j = Self.evaluate(plan: w.plan, kind: src.kind, entry: entry, change: change, previous: prevVersion) else { continue }
                     let type: String; if case .new = change { type = "new" } else { type = "changed" }
-                    let key = sha256("\(w.id!)|\(sourceID)|\(entry.externalKey)|\(entry.contentHash)|\(type)")
-                    var ev = Event(id: nil, watchID: w.id!, entryID: entry.id!, dedupeKey: key, title: entry.title, reason: reason,
-                                   evidenceURL: entry.canonicalURL, beforeSnippet: before, afterSnippet: after, createdAt: Date(), readAt: nil)
-                    if try Event.filter(Column("dedupeKey") == key).isEmpty(db) {
-                        try ev.insert(db)
-                        events.append(ev)
+                    var mk = mergeKey(entry.canonicalURL)
+                    if type == "changed" { mk += "#" + entry.contentHash }
+                    let ref = EvidenceRef(name: src.name, url: entry.canonicalURL)
+                    // Same content already reported for this watch (another source, same link/repo/title): add evidence, no new event.
+                    if var old = try Event.filter(Column("watchID") == w.id! && (Column("mergeKey") == mk || (entry.title.count >= 15 && Column("title") == entry.title))).fetchOne(db) {
+                        var ev = old.evidence
+                        if !ev.contains(ref) { ev.append(ref); old.evidence = ev }
+                        if Self.rank(j.kind) > Self.rank(old.kind) { old.kind = j.kind; old.reason = j.reason }
+                        try old.update(db)
+                        continue
                     }
+                    var ev = Event(id: nil, watchID: w.id!, entryID: entry.id!, dedupeKey: sha256("\(w.id!)|\(mk)|\(type)"), title: entry.title, reason: j.reason,
+                                   evidenceURL: entry.canonicalURL, beforeSnippet: j.before, afterSnippet: j.after, createdAt: Date(), readAt: nil,
+                                   kind: j.kind, mergeKey: mk)
+                    ev.evidence = [ref]
+                    try ev.insert(db)
+                    events.append(ev)
                 }
             }
         }
@@ -100,34 +115,59 @@ public final class Engine {
         return (events, changes.count)
     }
 
-    static func evaluate(plan: WatchPlan, kind: SourceKind, entry: Entry, change: Change) -> (String, String?, String?)? {
+    struct Judged { var reason: String; var kind: String; var before: String? = nil; var after: String? = nil }
+
+    static func rank(_ kind: String) -> Int { ["update": 0, "pageChange": 1, "majorUpdate": 2, "newProject": 3][kind] ?? 0 }
+
+    static let majorWords = ["release", "released", "launch", "introducing", "announcing", "announce", "open source", "open-source", "v1", "1.0", "2.0",
+                             "发布", "上线", "重磅", "全新", "正式版", "major"]
+
+    /// Is a freshly discovered GitHub repo worth an alert? Young repos need fewer stars; the threshold is the plan's (default 50).
+    static func worthAlert(stars: Int, ageDays: Double, minStars: Int?) -> Bool {
+        let need = minStars ?? 50
+        return ageDays <= 14 ? stars >= max(10, need / 5) : stars >= need
+    }
+
+    static func evaluate(plan: WatchPlan, kind: SourceKind, entry: Entry, change: Change, previous: Version? = nil) -> Judged? {
         let hay = entry.title + " " + entry.summary + " " + (kind == .web ? "" : entry.text)
+        func relevant(_ text: String) -> Bool {
+            (plan.exclude.isEmpty || !Keywords.matches(text, any: plan.exclude)) && (plan.include.isEmpty || Keywords.matches(text, any: plan.include))
+        }
         switch kind {
         case .githubReleases:
             if entry.meta["draft"] == "1" { return nil }
             if plan.stableOnly && entry.meta["prerelease"] == "1" { return nil }
             let tag = entry.meta["tag"] ?? entry.title
+            let have = Version(tag)
             if let minV = plan.minimumVersion {
-                guard let need = Version(minV), let have = Version(tag), have >= need else { return nil }
+                guard let need = Version(minV), let have, have >= need else { return nil }
             }
-            if !plan.exclude.isEmpty && Keywords.matches(hay, any: plan.exclude) { return nil }
-            if !plan.include.isEmpty && !Keywords.matches(hay, any: plan.include) { return nil }
-            let pre = entry.meta["prerelease"] == "1" ? "预发布" : "正式版"
-            return ("新\(pre)：\(tag)", nil, nil)
+            guard relevant(hay) else { return nil }
+            let pre = entry.meta["prerelease"] == "1"
+            // stable release that bumps major or minor over the previous stable one = major update; patch/prerelease = ordinary
+            var major = false
+            if !pre, let have, let previous { major = have.nums[0] > previous.nums[0] || (have.nums[0] == previous.nums[0] && have.nums[1] > previous.nums[1]) }
+            return Judged(reason: "新\(pre ? "预发布" : "正式版")：\(tag)" + (major ? "（主要/次要版本升级）" : ""), kind: major ? "majorUpdate" : "update")
         case .githubSearch:
-            if !plan.exclude.isEmpty && Keywords.matches(hay, any: plan.exclude) { return nil }
-            if !plan.include.isEmpty && !Keywords.matches(hay, any: plan.include) { return nil }
-            return ("此来源新发现的项目（★\(entry.meta["stars"] ?? "?")）", nil, nil)
-        case .rss:
-            if !plan.exclude.isEmpty && Keywords.matches(hay, any: plan.exclude) { return nil }
-            if !plan.include.isEmpty && !Keywords.matches(hay, any: plan.include) { return nil }
-            return ("新文章", nil, nil)
+            guard relevant(hay) else { return nil }
+            let stars = Int(entry.meta["stars"] ?? "") ?? 0
+            let age = Date().timeIntervalSince(entry.publishedAt ?? entry.firstSeenAt) / 86400
+            guard worthAlert(stars: stars, ageDays: age, minStars: plan.minStars) else { return nil }
+            // cheap sanity: a real project says what it is, and a pile of stars with zero forks is usually inflated
+            let forks = Int(entry.meta["forks"] ?? "") ?? 0
+            guard entry.summary.count >= 10, !(stars >= 20 && forks == 0) else { return nil }
+            let lang = entry.meta["language"].flatMap { $0.isEmpty ? nil : " · " + $0 } ?? ""
+            return Judged(reason: "新项目 · 创建 \(Int(age)) 天 · ★\(stars)\(lang)", kind: "newProject")
+        case .rss, .list:
+            guard relevant(hay) else { return nil }
+            let t = entry.title.lowercased()
+            let major = majorWords.contains { t.contains($0) }
+            return Judged(reason: kind == .list ? "列表页新条目" : "新文章", kind: major ? "majorUpdate" : "update")
         case .web:
             guard case .changed(let before) = change else { return nil }
-            if !plan.exclude.isEmpty && Keywords.matches(entry.text, any: plan.exclude) { return nil }
-            if !plan.include.isEmpty && !Keywords.matches(entry.text, any: plan.include) { return nil }
+            guard relevant(entry.text) else { return nil }
             let (b, a) = diffSnippets(before, entry.text)
-            return ("页面正文发生变化", b, a)
+            return Judged(reason: "页面正文发生变化", kind: "pageChange", before: b, after: a)
         }
     }
 

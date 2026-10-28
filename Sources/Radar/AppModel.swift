@@ -34,6 +34,7 @@ final class AppModel: NSObject, ObservableObject, UNUserNotificationCenterDelega
         didSet { UserDefaults.standard.set(paused, forKey: "paused") }
     }
     @Published var unread = 0
+    @Published var driveNL: String?   // dev aid (RADAR_DRIVE_*): a natural-language edit to apply to the open watch
     @Published var recent: [Event] = []
     private var observer: AnyDatabaseCancellable?
     private var timer: Timer?
@@ -47,7 +48,7 @@ final class AppModel: NSObject, ObservableObject, UNUserNotificationCenterDelega
         engine = Engine(store: store, fetcher: fetcher)
         discovery = Discovery(fetcher: fetcher, store: store)
         super.init()
-        tokenBox.value = Keychain.get()
+        tokenBox.value = ProcessInfo.processInfo.environment["GITHUB_TOKEN"] ?? Keychain.get()
         self.tokenBox = tokenBox
         searchBox.value = ProcessInfo.processInfo.environment["EXA_API_KEY"] ?? Keychain.get(Keychain.searchService)
         self.searchBox = searchBox
@@ -97,7 +98,9 @@ final class AppModel: NSObject, ObservableObject, UNUserNotificationCenterDelega
     func notify(_ events: [Event]) {
         let watches = (try? store.db.read { try Watch.fetchAll($0) }) ?? []
         for e in events {
-            guard watches.first(where: { $0.id == e.watchID })?.plan.notify ?? false else { continue }
+            guard let plan = watches.first(where: { $0.id == e.watchID })?.plan, plan.notify else { continue }
+            // topic watches only interrupt for new projects / major updates; ordinary posts stay in the list
+            if plan.type == .topic && e.kind == "update" { continue }
             let c = UNMutableNotificationContent()
             c.title = e.title; c.body = e.reason; c.userInfo = ["url": e.evidenceURL]
             UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: e.dedupeKey, content: c, trigger: nil))

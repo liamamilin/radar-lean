@@ -3,13 +3,14 @@ import GRDB
 import CryptoKit
 
 public enum SourceKind: String, Codable, CaseIterable {
-    case githubReleases, githubSearch, rss, web
+    case githubReleases, githubSearch, rss, web, list
     public var label: String {
         switch self {
         case .githubReleases: return "GitHub Releases"
         case .githubSearch: return "GitHub 仓库发现"
         case .rss: return "RSS / Atom"
         case .web: return "静态网页"
+        case .list: return "文章/项目列表页"
         }
     }
     public var defaultInterval: Double {
@@ -17,7 +18,7 @@ public enum SourceKind: String, Codable, CaseIterable {
         case .githubReleases: return 2 * 3600
         case .rss: return 4 * 3600
         case .githubSearch: return 12 * 3600
-        case .web: return 6 * 3600
+        case .web, .list: return 6 * 3600
         }
     }
 }
@@ -33,6 +34,8 @@ public struct WatchPlan: Codable, Equatable {
     public var stableOnly = false
     public var minimumVersion: String?
     public var notify = true
+    public var minStars: Int?          // GitHub 新项目的 Stars 门槛（空 = 默认 50）
+    public var unsupported: [String]?  // 听懂但无法自动判断的条件，原样展示给用户
     public init(type: PlanType, title: String) { self.type = type; self.title = title }
 }
 
@@ -112,9 +115,18 @@ public struct Event: Codable, FetchableRecord, MutablePersistableRecord, Identif
     public var afterSnippet: String?
     public var createdAt: Date
     public var readAt: Date?
+    public var kind = "update"          // newProject / majorUpdate / update / pageChange
+    public var mergeKey = ""
+    public var evidenceJSON: String?    // [EvidenceRef]：同一内容的各来源出处
+    public var evidence: [EvidenceRef] {
+        get { evidenceJSON.flatMap { try? JSONDecoder().decode([EvidenceRef].self, from: Data($0.utf8)) } ?? [] }
+        set { evidenceJSON = String(decoding: (try? JSONEncoder().encode(newValue)) ?? Data(), as: UTF8.self) }
+    }
     public static let databaseTableName = "event"
     public mutating func didInsert(_ inserted: InsertionSuccess) { id = inserted.rowID }
 }
+
+public struct EvidenceRef: Codable, Hashable { public var name: String; public var url: String }
 
 public func sha256(_ s: String) -> String {
     SHA256.hash(data: Data(s.utf8)).map { String(format: "%02x", $0) }.joined()
@@ -186,6 +198,13 @@ public final class Store {
                 t.column("readAt", .datetime)
             }
         }
+        m.registerMigration("v2") { db in
+            try db.alter(table: "event") { t in
+                t.add(column: "kind", .text).notNull().defaults(to: "update")
+                t.add(column: "mergeKey", .text).notNull().defaults(to: "")
+                t.add(column: "evidenceJSON", .text)
+            }
+        }
         try m.migrate(db)
     }
 
@@ -228,6 +247,13 @@ public final class Store {
         return w
     }
 
+    public func detach(watchID: Int64, sourceID: Int64) throws {
+        try db.write { db in
+            try db.execute(sql: "DELETE FROM watchSource WHERE watchID = ? AND sourceID = ?", arguments: [watchID, sourceID])
+            try db.execute(sql: "DELETE FROM source WHERE id NOT IN (SELECT sourceID FROM watchSource)")
+        }
+    }
+
     public func deleteWatch(_ id: Int64) throws {
         try db.write { db in
             _ = try Watch.deleteOne(db, key: id)
@@ -251,6 +277,7 @@ public struct SourceSpec: Hashable, Codable {
         case .githubReleases: return "github-releases:" + endpoint.lowercased()
         case .githubSearch: return "github-search:" + endpoint.lowercased().split(separator: " ").joined(separator: " ")
         case .rss: return "rss:" + normalizeURL(endpoint)
+        case .list: return "list:" + normalizeURL(endpoint)
         case .web: return "web:" + normalizeURL(endpoint) + "#" + (selector ?? "default")
         }
     }
@@ -261,4 +288,17 @@ public func normalizeURL(_ s: String) -> String {
     c.scheme = c.scheme?.lowercased(); c.host = c.host?.lowercased(); c.fragment = nil
     if c.path.count > 1 && c.path.hasSuffix("/") { c.path.removeLast() }
     return c.string ?? s
+}
+
+/// Identity of a piece of content across sources: a GitHub repo, or a URL without scheme/www/tracking.
+public func mergeKey(_ s: String) -> String {
+    // a repo home page is the repo itself; deeper GitHub links (a release, an issue) are distinct content
+    if let repo = PlanParser.githubRepo(s), URL(string: s)?.pathComponents.filter({ $0 != "/" }).count == 2 { return "gh:" + repo.lowercased() }
+    guard var c = URLComponents(string: s) else { return s }
+    c.queryItems = c.queryItems?.filter { !($0.name.hasPrefix("utm_") || ["ref", "source", "fbclid"].contains($0.name)) }
+    if c.queryItems?.isEmpty == true { c.queryItems = nil }
+    c.fragment = nil
+    var host = (c.host ?? "").lowercased(); if host.hasPrefix("www.") { host.removeFirst(4) }
+    var path = c.path; if path.count > 1 && path.hasSuffix("/") { path.removeLast() }
+    return "u:" + host + path + (c.query.map { "?" + $0 } ?? "")
 }

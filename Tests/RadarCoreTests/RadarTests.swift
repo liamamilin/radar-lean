@@ -276,3 +276,99 @@ final class RankTests: Base {
         XCTAssertEqual(c.first { $0.spec.name.hasPrefix("off.test") }?.matched, 0)
     }
 }
+
+final class JudgeTests: Base {
+    func ago(_ days: Double) -> String { Fetcher.iso.string(from: Date().addingTimeInterval(-days * 86400)) }
+    let searchURL = "https://api.github.com/search/repositories"
+
+    func testAcceptanceSentenceParse() {
+        let p = PlanParser.parse("我想关注 AI 开源项目，尤其是 Agent 和本地模型，有真正值得关注的新项目时提醒我")
+        XCTAssertEqual(p.type, .topic)
+        XCTAssertEqual(p.title, "AI 开源项目")
+        XCTAssertEqual(p.include, ["Agent", "本地模型"])       // the alert clause must not become a keyword
+        let q = PlanParser.parse("关注 Rust 项目，要创新的，stars 100 以上")
+        XCTAssertEqual(q.minStars, 100)
+        XCTAssertEqual(q.unsupported?.count, 1)
+    }
+
+    func testGitHubDiscoveryFiltersAndClassifies() async throws {
+        var plan = WatchPlan(type: .topic, title: "ai"); plan.include = ["agent"]
+        let (_, s) = try watch(plan, SourceSpec(kind: .githubSearch, endpoint: "topic:ai-agents", name: "gh"))
+        func item(_ id: Int, _ name: String, _ stars: Int, _ age: Double, _ desc: String, fork: Bool = false) -> String {
+            #"{"id":\#(id),"full_name":"\#(name)","html_url":"https://github.com/\#(name)","description":"\#(desc)","stargazers_count":\#(stars),"forks_count":1,"language":"Python","topics":[],"created_at":"\#(ago(age))","pushed_at":"\#(ago(1))","fork":\#(fork),"archived":false}"#
+        }
+        Stub.routes[searchURL] = .init(body: Data(#"{"items":[]}"#.utf8))
+        var o = await engine.check(sourceID: s.id!)
+        XCTAssertEqual(o.events.count, 0)
+        let items = [item(1, "a/solid", 200, 40, "An agent framework"), item(2, "b/small", 12, 40, "An agent toy"),
+                     item(3, "c/fresh", 12, 3, "Fresh agent runtime"), item(4, "d/forked", 500, 40, "agent fork", fork: true),
+                     item(5, "e/offtopic", 900, 40, "A database")]
+        Stub.routes[searchURL] = .init(body: Data(#"{"items":[\#(items.joined(separator: ","))]}"#.utf8))
+        o = await engine.check(sourceID: s.id!)
+        XCTAssertEqual(o.events.map { $0.title }.sorted(), ["a/solid", "c/fresh"])   // small old, fork and off-topic dropped
+        XCTAssertTrue(o.events.allSatisfy { $0.kind == "newProject" })
+        o = await engine.check(sourceID: s.id!)
+        XCTAssertEqual(o.events.count, 0)
+    }
+
+    func testListPageItems() throws {
+        let posts = (1...6).map { #"<li><a href="/blog/post-number-\#($0)">Post number \#($0) about agents</a> <time datetime="2026-10-0\#($0)">d</time><p>Summary \#($0)</p></li>"# }
+        let html = "<html><head><title>Blog</title></head><body><nav><a href=\"/about-us-page\">About us and more</a></nav><ul>\(posts.joined())</ul></body></html>"
+        let r = try engine.fetcher.extractList(html: html, url: URL(string: "https://x.test/blog")!)
+        XCTAssertEqual(r.entries.count, 6)
+        XCTAssertEqual(r.entries[0].url, "https://x.test/blog/post-number-1")
+        XCTAssertNotNil(r.entries[0].publishedAt)
+        XCTAssertThrowsError(try engine.fetcher.extractList(html: "<html><body><p>one <a href=\"/a/b/c\">single article link here</a></p></body></html>", url: URL(string: "https://x.test/p")!))
+    }
+
+    func testListSourceIncrementalAndMerge() async throws {
+        func page(_ n: Int) -> Data {
+            let li = (1...n).map { #"<li><a href="/blog/post-number-\#($0)">Post number \#($0) about agents</a></li>"# }.joined()
+            return Data("<html><body><ul>\(li)</ul></body></html>".utf8)
+        }
+        func feed(_ n: Int) -> Data {
+            let it = (1...n).map { "<item><title>Post number \($0) about agents</title><link>https://x.test/blog/post-number-\($0)/?utm_source=rss</link></item>" }.joined()
+            return Data("<?xml version=\"1.0\"?><rss version=\"2.0\"><channel><title>t</title>\(it)</channel></rss>".utf8)
+        }
+        let plan = WatchPlan(type: .topic, title: "x")
+        let (w, list) = try watch(plan, SourceSpec(kind: .list, endpoint: "https://x.test/blog", name: "list"))
+        let rss = try store.attach(watchID: w.id!, spec: SourceSpec(kind: .rss, endpoint: "https://x.test/feed", name: "feed"))
+        Stub.routes["https://x.test/blog"] = .init(body: page(6)); Stub.routes["https://x.test/feed"] = .init(body: feed(6))
+        _ = await engine.check(sourceID: list.id!); _ = await engine.check(sourceID: rss.id!)
+        Stub.routes["https://x.test/blog"] = .init(body: page(7)); Stub.routes["https://x.test/feed"] = .init(body: feed(7))
+        let a = await engine.check(sourceID: list.id!)
+        XCTAssertEqual(a.events.count, 1)
+        let b = await engine.check(sourceID: rss.id!)
+        XCTAssertEqual(b.events.count, 0)                                            // same post via the feed: merged, not repeated
+        let ev = try events()
+        XCTAssertEqual(ev.count, 1)
+        XCTAssertEqual(Set(ev[0].evidence.map { $0.name }), ["list", "feed"])        // both sources kept as evidence
+    }
+
+    func testMajorVersusPatchRelease() async throws {
+        let plan = WatchPlan(type: .githubRelease, title: "x")
+        let (_, s) = try watch(plan, Self.relSpec)
+        func rel(_ id: Int, _ tag: String) -> String { #"{"id":\#(id),"tag_name":"\#(tag)","name":"\#(tag)","html_url":"https://github.com/example/radar-fixture/releases/tag/\#(tag)","draft":false,"prerelease":false,"body":""}"# }
+        Stub.routes[Self.relURL] = .init(body: Data("[\(rel(1, "v1.2.0"))]".utf8))
+        _ = await engine.check(sourceID: s.id!)
+        Stub.routes[Self.relURL] = .init(body: Data("[\(rel(3, "v1.2.1")),\(rel(2, "v1.3.0")),\(rel(1, "v1.2.0"))]".utf8))
+        let o = await engine.check(sourceID: s.id!)
+        XCTAssertEqual(Dictionary(uniqueKeysWithValues: o.events.map { ($0.title, $0.kind) }), ["v1.2.1": "update", "v1.3.0": "majorUpdate"])
+    }
+
+    func testPausedWatchGetsNoEventsAndResumes() async throws {
+        let plan = WatchPlan(type: .githubRelease, title: "x")
+        let (w, s) = try watch(plan, Self.relSpec)
+        func rel(_ id: Int) -> String { #"{"id":\#(id),"tag_name":"v1.\#(id).0","name":"v1.\#(id).0","html_url":"https://github.com/example/radar-fixture/releases/tag/v1.\#(id).0","draft":false,"prerelease":false,"body":""}"# }
+        Stub.routes[Self.relURL] = .init(body: Data("[\(rel(1))]".utf8))
+        _ = await engine.check(sourceID: s.id!)
+        try await store.db.write { try $0.execute(sql: "UPDATE watch SET status = 'paused' WHERE id = ?", arguments: [w.id]) }
+        Stub.routes[Self.relURL] = .init(body: Data("[\(rel(2)),\(rel(1))]".utf8))
+        var o = await engine.check(sourceID: s.id!)
+        XCTAssertEqual(o.events.count, 0)                      // paused: nothing reported
+        try await store.db.write { try $0.execute(sql: "UPDATE watch SET status = 'active' WHERE id = ?", arguments: [w.id]) }
+        Stub.routes[Self.relURL] = .init(body: Data("[\(rel(3)),\(rel(2)),\(rel(1))]".utf8))
+        o = await engine.check(sourceID: s.id!)
+        XCTAssertEqual(o.events.map { $0.title }, ["v1.3.0"])  // resumed: only what is new since, not the paused backlog
+    }
+}

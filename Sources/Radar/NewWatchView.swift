@@ -25,7 +25,7 @@ struct NewWatchView: View {
                     Text("例如：关注 AI 开源项目，尤其是 Agent 和本地模型，排除 AI 绘画\n或：关注 https://github.com/owner/repo 的稳定版，1.0 以上提醒\n或：这个博客有关于本地 AI 的新文章就告诉我 https://…").font(.caption).foregroundStyle(.secondary)
                     HStack {
                         Button("分析并查找来源") { Task { await analyze() } }.disabled(text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || busy)
-                        if busy { ProgressView().controlSize(.small) }
+                        if busy { ProgressView().controlSize(.small); Text("正在分析并试读来源（联网搜索可能需要十几秒）…").font(.caption).foregroundStyle(.secondary) }
                     }
                 }
                 if var p = plan {
@@ -33,6 +33,13 @@ struct NewWatchView: View {
                         TextField("名称", text: Binding(get: { plan?.title ?? "" }, set: { plan?.title = $0 }))
                         TextField("包含关键词（逗号分隔）", text: $includeText)
                         TextField("排除关键词", text: $excludeText)
+                        if let u = p.unsupported, !u.isEmpty {
+                            ForEach(u, id: \.self) { Label($0, systemImage: "exclamationmark.triangle").font(.caption).foregroundStyle(.orange) }
+                        }
+                        if p.type == .topic {
+                            TextField("GitHub 新项目最低 Stars（默认 50）", text: Binding(get: { plan?.minStars.map(String.init) ?? "" }, set: { plan?.minStars = Int($0) }))
+                            Text("“值得关注”的判定：近 90 天创建、非 fork/归档、Stars 达标（创建 14 天内的新项目门槛降为 1/5，至少 10）。其余只列在更新里，不弹通知。").font(.caption).foregroundStyle(.secondary)
+                        }
                         if p.type == .githubRelease {
                             Toggle("仅稳定版", isOn: Binding(get: { plan?.stableOnly ?? false }, set: { plan?.stableOnly = $0 }))
                             TextField("最低版本", text: Binding(get: { plan?.minimumVersion ?? "" }, set: { plan?.minimumVersion = $0.isEmpty ? nil : $0 }))
@@ -85,6 +92,9 @@ struct NewWatchView: View {
                     .disabled(plan == nil || selected.isEmpty)
             }.padding(12)
         }.frame(width: 640, height: 640)
+        .task {
+            if let t = ProcessInfo.processInfo.environment["RADAR_DRIVE_TEXT"] { text = t; await analyze(); create() }   // dev aid, see ContentView.drive
+        }
     }
 
     func analyze() async {
@@ -94,10 +104,15 @@ struct NewWatchView: View {
         includeText = p.include.joined(separator: ", "); excludeText = p.exclude.joined(separator: ", ")
         plan = p
         candidates = await model.discovery.findSources(plan: p, text: text)
-        selected = Set(candidates.filter { $0.ok && ($0.matched ?? 1) > 0 }.prefix(p.type == .topic ? 4 : 1).map { $0.id })
-        if p.type == .topic && !model.searchEnabled { message = "未配置联网搜索（设置里填 Brave Search API Key），只用了内置目录和 GitHub 搜索。" }
+        if p.type == .topic {
+            // GitHub sources are always relevant by construction; web-found sources must actually mention the keywords
+            let gh = candidates.filter { $0.ok && $0.matched == nil }, web = candidates.filter { $0.ok && ($0.matched ?? 0) > 0 }.prefix(4)
+            selected = Set((gh + web).map { $0.id })
+        } else { selected = Set(candidates.filter { $0.ok }.prefix(1).map { $0.id }) }
+        let noSearch = p.type == .topic && !model.searchEnabled
         if p.type == .topic && candidates.isEmpty { message = "内置目录没有匹配这个主题的来源。请提供 GitHub 仓库、RSS 或网页 URL。" }
         else if !candidates.contains(where: { $0.ok }) { message = "没有可用来源，不会创建空任务。" }
+        else if noSearch { message = "未配置联网搜索（设置里填 Exa API Key），只用了内置目录和 GitHub 搜索。" }
         p.include = []; _ = p
     }
 

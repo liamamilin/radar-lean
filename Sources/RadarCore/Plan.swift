@@ -57,6 +57,20 @@ public enum PlanParser {
         return nil
     }
 
+    static func minStars(in text: String) -> Int? {
+        let p = #"(?:stars?|星标|星星|★)\s*(?:>=|≥|超过|大于|至少|不少于|over|above)?\s*(\d+)\s*(?:以上|\+)?|(?:超过|至少|不少于|over|above)\s*(\d+)\s*(?:个)?\s*(?:stars?|星标|星星|★)"#
+        guard let r = text.range(of: p, options: [.regularExpression, .caseInsensitive]),
+              let n = String(text[r]).range(of: #"\d+"#, options: .regularExpression) else { return nil }
+        return Int(String(text[r])[n])
+    }
+
+    /// Conditions we understand as requests but cannot judge automatically; shown to the user instead of silently ignored.
+    static let semanticMarkers = ["创新", "有趣", "新手友好", "适合初学者", "适合新手", "易用", "好用", "权威", "商用", "可商用", "免费", "国产", "中文",
+                                  "生产可用", "成熟", "性能好", "性能更好", "轻量", "文档完善", "社区活跃", "大厂", "靠谱"]
+    static func unsupportedConditions(in text: String) -> [String] {
+        semanticMarkers.filter { text.contains($0) }.map { "「\($0)」：无法自动判断，未生效" }
+    }
+
     static func splitList(_ s: String) -> [String] {
         var t = s
         for sep in ["，", ",", "、", "；", ";", "以及", "还有", " and ", "和", "及", "与", "/"] { t = t.replacingOccurrences(of: sep, with: "|") }
@@ -72,6 +86,8 @@ public enum PlanParser {
                 if let end = rest.firstIndex(where: { "。.;；\n".contains($0) }) { rest = String(rest[..<end]) }
                 let cut = ["，排除", ",排除", "，不要", "，除了", ", exclude", "，尤其", "，优先", "，特别"]
                 for c in cut { if let cr = rest.range(of: c) { rest = String(rest[..<cr.lowerBound]) } }
+                // a trailing "，有……时提醒我" style clause is the alert condition, not a keyword
+                if let cr = rest.range(of: #"[，,]\s*(有|当|如果|若|要是|一旦|出现|发现|遇到|提醒|通知|请|并|而且|最好|希望)"#, options: .regularExpression) { rest = String(rest[..<cr.lowerBound]) }
                 if !rest.trimmingCharacters(in: .whitespaces).isEmpty { return rest }
             }
         }
@@ -105,6 +121,9 @@ public enum PlanParser {
             plan.stableOnly = true
         }
         plan.minimumVersion = minimumVersion(in: t)
+        plan.minStars = minStars(in: t)
+        let unsup = unsupportedConditions(in: t)
+        plan.unsupported = unsup.isEmpty ? nil : unsup
         if plan.minimumVersion != nil && plan.type == .githubRelease { plan.stableOnly = plan.stableOnly || lower.contains("版") }
         if let ex = clause(after: ["排除", "不要关注", "不包括", "除去", "除了", "exclude ", "excluding ", "without "], in: t) {
             plan.exclude = splitList(ex).filter { !$0.contains("预发布") }
@@ -153,6 +172,9 @@ public enum PlanParser {
             let items = splitList(add)
             if !items.isEmpty { p.include = Array(NSOrderedSet(array: p.include + items)) as? [String] ?? p.include + items; changed = true }
         }
+        if let n = minStars(in: t) { p.minStars = n; changed = true }
+        let u = unsupportedConditions(in: t)
+        if !u.isEmpty { p.unsupported = Array(NSOrderedSet(array: (p.unsupported ?? []) + u)) as? [String] ?? u; changed = true }
         return changed ? p : nil
     }
 }

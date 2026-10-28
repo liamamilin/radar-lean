@@ -97,6 +97,7 @@ public final class Fetcher {
         case .githubSearch: return try await fetchSearch(src.endpoint, cond: cond)
         case .rss: return try await fetchFeed(src.endpoint, cond: cond)
         case .web: return try await fetchPage(src.endpoint, selector: src.selector, cond: cond)
+        case .list: return try await fetchList(src.endpoint, cond: cond)
         }
     }
 
@@ -124,30 +125,42 @@ public final class Fetcher {
         return FetchResult(entries: entries, etag: r.headers["etag"], title: repo)
     }
 
+    /// Two windows, merged: established-but-new repos (90 days, 30+ stars) and very fresh fast risers (14 days, 5+ stars),
+    /// so a brand-new project is seen long before it could reach the top of a 90-day star ranking.
     func fetchSearch(_ query: String, cond: [String: String]) async throws -> FetchResult {
-        // Rising new repositories for the query: created recently, ordered by stars.
-        let since = Date().addingTimeInterval(-90 * 86400)
+        var seen = Set<Int>(), entries: [FetchedEntry] = []
+        for (days, minStars, perPage) in [(90, 30, 100), (14, 5, 50)] {
+            for e in try await searchRepos(query, days: days, minStars: minStars, perPage: perPage) where seen.insert(Int(e.externalKey) ?? 0).inserted {
+                entries.append(e)
+            }
+        }
+        return FetchResult(entries: entries, title: query)
+    }
+
+    func searchRepos(_ query: String, days: Int, minStars: Int, perPage: Int) async throws -> [FetchedEntry] {
         let df = DateFormatter(); df.dateFormat = "yyyy-MM-dd"; df.timeZone = TimeZone(identifier: "UTC")
+        let since = df.string(from: Date().addingTimeInterval(-Double(days) * 86400))
         var c = URLComponents(string: "https://api.github.com/search/repositories")!
-        c.queryItems = [URLQueryItem(name: "q", value: "\(query) created:>=\(df.string(from: since))"),
+        c.queryItems = [URLQueryItem(name: "q", value: "\(query) created:>=\(since) stars:>=\(minStars) fork:false archived:false"),
                         URLQueryItem(name: "sort", value: "stars"), URLQueryItem(name: "order", value: "desc"),
-                        URLQueryItem(name: "per_page", value: "30")]
-        let r = try await get(c.url!, headers: githubHeaders())   // no conditional: query window moves daily
+                        URLQueryItem(name: "per_page", value: String(perPage))]
+        let r = try await get(c.url!, headers: githubHeaders(), maxBytes: 8_000_000)   // no conditional: query window moves daily
         try check(r, allow304: false)
         guard let o = try JSONSerialization.jsonObject(with: r.data) as? [String: Any], let items = o["items"] as? [[String: Any]]
         else { throw RadarError.parse("搜索响应格式不符") }
-        let entries: [FetchedEntry] = items.compactMap { i in
+        return items.compactMap { i in
             guard let id = i["id"] as? Int, let name = i["full_name"] as? String, let url = i["html_url"] as? String else { return nil }
+            if i["fork"] as? Bool == true || i["archived"] as? Bool == true { return nil }
             let desc = i["description"] as? String ?? ""
             let topics = (i["topics"] as? [String]) ?? []
             var e = FetchedEntry(externalKey: "\(id)", url: url, title: name, summary: desc,
                                  text: name + "\n" + desc + "\n" + topics.joined(separator: " "))
             e.publishedAt = (i["created_at"] as? String).flatMap { Self.iso.date(from: $0) }
-            e.meta = ["stars": "\(i["stargazers_count"] as? Int ?? 0)", "language": i["language"] as? String ?? "",
-                      "fullName": name, "topics": topics.joined(separator: ",")]
+            e.meta = ["stars": "\(i["stargazers_count"] as? Int ?? 0)", "forks": "\(i["forks_count"] as? Int ?? 0)",
+                      "language": i["language"] as? String ?? "", "fullName": name, "topics": topics.joined(separator: ","),
+                      "pushed": i["pushed_at"] as? String ?? ""]
             return e
         }
-        return FetchResult(entries: entries, title: query)
     }
 
     // MARK: RSS / Atom
@@ -221,6 +234,100 @@ public final class Fetcher {
                              summary: String(text.prefix(300)), text: text)
         e.meta = [:]
         return FetchResult(entries: [e], title: title)
+    }
+
+    // MARK: Article / project list pages (no RSS)
+
+    func fetchList(_ urlString: String, cond: [String: String]) async throws -> FetchResult {
+        guard let url = URL(string: urlString) else { throw RadarError.parse("无效地址") }
+        let r = try await get(url, headers: cond)
+        if r.status == 304 { return FetchResult(entries: [], notModified: true, etag: cond["If-None-Match"], lastModified: cond["If-Modified-Since"]) }
+        try check(r, allow304: true)
+        var res = try extractList(html: String(decoding: r.data, as: UTF8.self), url: r.url)
+        res.etag = r.headers["etag"]; res.lastModified = r.headers["last-modified"]
+        return res
+    }
+
+    static let skipPath = ["/tag", "/tags", "/category", "/categories", "/author", "/page", "/about", "/contact", "/privacy", "/login", "/signin", "/search", "/terms"]
+    static let genericText: Set<String> = ["read more", "learn more", "more", "阅读更多", "查看更多", "了解更多", "下一页", "上一页", "next", "previous", "home", "首页"]
+
+    /// Pull independent items (title, link, blurb, date) out of a static listing page: the biggest group of
+    /// same-structure links wins; fewer than 5 means it is an article, not a list.
+    public func extractList(html: String, url: URL) throws -> FetchResult {
+        let doc = try SwiftSoup.parse(html, url.absoluteString)
+        try doc.select("script, style, noscript, nav, footer, aside, template, svg, body > header").remove()
+        func host(_ u: URL?) -> String { (u?.host ?? "").lowercased().replacingOccurrences(of: "www.", with: "") }
+        let pageHost = host(url)
+        var groups: [String: [(Element, URL, String)]] = [:]
+        for a in try doc.select("a[href]").array() {
+            guard let u = URL(string: (try? a.absUrl("href")) ?? ""), ["http", "https"].contains(u.scheme ?? "") else { continue }
+            let h = host(u)
+            guard h == pageHost || h == "github.com" else { continue }
+            let path = u.path.lowercased()
+            if path.count < 2 || normalizeURL(u.absoluteString) == normalizeURL(url.absoluteString) { continue }
+            if Self.skipPath.contains(where: { path.hasPrefix($0) }) { continue }
+            var title = ((try? a.select("h1,h2,h3,h4").first()?.text()) ?? nil) ?? ((try? a.text()) ?? "")
+            title = title.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
+            let cjk = title.unicodeScalars.contains { $0.value > 0x2E80 }
+            // "Read analysis"-style call-to-action links: take the card's single heading instead
+            if let box = Self.card(a, title), let hs = try? box.select("h1,h2,h3,h4"), hs.count == 1, ((try? box.select("a[href]").count) ?? 9) <= 4,
+               (try? a.select("h1,h2,h3,h4").first()) == nil, let ht = try? hs.first()?.text(), ht.count >= 8 {
+                title = ht.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
+            }
+            let low = title.lowercased()
+            guard title.count >= (cjk ? 6 : 12), title.count <= 200, !Self.genericText.contains(low),
+                  !(low.hasPrefix("read ") && title.count < 24), !low.hasPrefix("continue reading") else { continue }
+            let p = a.parent(), g = p?.parent()
+            let sig = [p?.tagName(), (try? p?.className()).flatMap { $0 }.map { String($0.split(separator: " ").first ?? "") }, g?.tagName()].compactMap { $0 }.joined(separator: "/")
+            groups[sig, default: []].append((a, u, title))
+        }
+        func size(_ g: [(Element, URL, String)]) -> Int { Set(g.map { normalizeURL($0.1.absoluteString) }).count }
+        guard let best = groups.values.max(by: { size($0) < size($1) }) else {
+            throw RadarError.unsupported("没有识别出文章/项目列表")
+        }
+        var seen = Set<String>(), entries: [FetchedEntry] = []
+        for (a, u, title) in best where seen.insert(normalizeURL(u.absoluteString)).inserted {
+            let box = Self.card(a, title)
+            var blurb = (try? box?.text()) ?? ""
+            blurb = blurb.replacingOccurrences(of: title, with: "").split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
+            var e = FetchedEntry(externalKey: normalizeURL(u.absoluteString), url: u.absoluteString, title: title, summary: String(blurb.prefix(240)))
+            if let t = try? box?.select("time[datetime]").first()?.attr("datetime") { e.publishedAt = Self.iso.date(from: t) ?? Self.day(t) }
+            else if let m = blurb.range(of: #"\d{4}-\d{2}-\d{2}"#, options: .regularExpression) { e.publishedAt = Self.day(String(blurb[m])) }
+            entries.append(e)
+            if entries.count == 60 { break }
+        }
+        guard entries.count >= 5 else { throw RadarError.unsupported("没有识别出文章/项目列表（只找到 \(entries.count) 条）") }
+        return FetchResult(entries: entries, title: (try? doc.title()).flatMap { $0.isEmpty ? nil : $0 })
+    }
+
+    /// The small enclosing block that holds a link's title and blurb (grow until it has some text beyond the title).
+    static func card(_ a: Element, _ title: String) -> Element? {
+        var box: Element? = a.parent()
+        for _ in 0..<3 { if let b = box, ((try? b.text().count) ?? 0) > title.count + 30 { break } else { box = box?.parent() } }
+        return box
+    }
+
+    static func day(_ s: String) -> Date? {
+        let f = DateFormatter(); f.locale = Locale(identifier: "en_US_POSIX"); f.dateFormat = "yyyy-MM-dd"
+        return f.date(from: String(s.prefix(10)))
+    }
+
+    /// First page among a few likely ones (site root, the given URL, then /blog /news … links) that reads as a list.
+    public func findList(starting: [String]) async -> String? {
+        var queue = starting, seen = Set<String>(), tries = 0
+        while tries < 3, !queue.isEmpty {
+            let u = queue.removeFirst()
+            guard seen.insert(normalizeURL(u)).inserted, let url = URL(string: u) else { continue }
+            tries += 1
+            guard let r = try? await get(url), (200..<300).contains(r.status) else { continue }
+            let html = String(decoding: r.data, as: UTF8.self)
+            if (try? extractList(html: html, url: r.url)) != nil { return r.url.absoluteString }
+            for a in ((try? SwiftSoup.parse(html, r.url.absoluteString).select("a[href]").array()) ?? []) {
+                guard let hu = URL(string: (try? a.absUrl("href")) ?? ""), hu.host == r.url.host, hu.pathComponents.count <= 2 else { continue }
+                if ["/blog", "/news", "/articles", "/posts", "/changelog", "/releases", "/updates"].contains(where: { hu.path.lowercased().hasPrefix($0) }) { queue.append(hu.absoluteString) }
+            }
+        }
+        return nil
     }
 
     /// Exa web search results (title, url). Empty when no API key is configured.

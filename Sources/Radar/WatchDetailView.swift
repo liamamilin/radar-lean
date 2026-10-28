@@ -41,7 +41,13 @@ struct WatchDetailView: View {
                         Toggle("仅稳定版（排除预发布）", isOn: $plan.stableOnly)
                         TextField("最低版本（如 1.0.0）", text: Binding(get: { plan.minimumVersion ?? "" }, set: { plan.minimumVersion = $0.isEmpty ? nil : $0 }))
                     }
-                    Toggle("系统通知", isOn: $plan.notify)
+                    if let u = plan.unsupported, !u.isEmpty {
+                        ForEach(u, id: \.self) { Label($0, systemImage: "exclamationmark.triangle").font(.caption).foregroundStyle(.orange) }
+                    }
+                    if plan.type == .topic {
+                        TextField("GitHub 新项目最低 Stars（默认 50）", text: Binding(get: { plan.minStars.map(String.init) ?? "" }, set: { plan.minStars = Int($0) }))
+                    }
+                    Toggle(plan.type == .topic ? "系统通知（仅新项目 / 重大更新）" : "系统通知", isOn: $plan.notify)
                     HStack {
                         TextField("用一句话调整，例如：排除 AI 绘画 / 不要预发布", text: $nl).onSubmit(applyNL)
                         Button("应用", action: applyNL).disabled(nl.isEmpty)
@@ -70,6 +76,7 @@ struct WatchDetailView: View {
         .formStyle(.grouped)
         .navigationTitle(watch?.title ?? "")
         .task(id: model.revision) { await load() }
+        .onChange(of: model.driveNL) { _, v in if let v { nl = v; model.driveNL = nil; applyNL() } }
     }
 
     func sourceRow(_ s: Source) -> some View {
@@ -80,6 +87,7 @@ struct WatchDetailView: View {
                 Spacer()
                 intervalPicker(s)
                 Button("检查") { Task { await model.check(sourceID: s.id!) } }.disabled(model.checking > 0)
+                Button { try? model.store.detach(watchID: watchID, sourceID: s.id!) } label: { Image(systemName: "minus.circle") }.help("从这个关注里移除此来源")
             }
             Text(s.endpoint).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
             if !s.initialized && s.lastError == nil { Text("等待首次读取…").font(.caption) }
@@ -150,8 +158,22 @@ struct WatchDetailView: View {
     }
     func save() {
         guard let watch else { return }
+        let oldInclude = watch.plan.include
         plan.include = list(includeText); plan.exclude = list(excludeText)
         model.savePlan(watch, plan)
+        if plan.type == .topic && plan.include != oldInclude { Task { await rediscover() } }
+    }
+
+    /// The topic changed: look for sources for the new keywords, attach the good ones (no backfill), and flag the ones that no longer fit.
+    func rediscover() async {
+        model.checking += 1; defer { model.checking -= 1 }
+        nlMessage = "关注目标变了，正在重新发现来源…"
+        let (fresh, stale) = await model.discovery.rediscover(watchID: watchID, plan: plan, text: watch?.originalText ?? "")
+        var parts: [String] = []
+        parts.append(fresh.isEmpty ? "没有找到新的合适来源" : "新增来源：" + fresh.map { $0.spec.name }.joined(separator: "、") + "（只记录基线，不补报历史）")
+        if !stale.isEmpty { parts.append("这些来源近期没有含新关键词的内容，可用来源右侧的 − 移除：" + stale.joined(separator: "、")) }
+        nlMessage = parts.joined(separator: "。")
+        await model.check(watchID: watchID)
     }
     func applyNL() {
         Task {
