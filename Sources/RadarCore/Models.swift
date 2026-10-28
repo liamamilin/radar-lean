@@ -117,7 +117,8 @@ public struct Event: Codable, FetchableRecord, MutablePersistableRecord, Identif
     public var readAt: Date?
     public var kind = "update"          // newProject / majorUpdate / update / pageChange
     public var mergeKey = ""
-    public var repoKey = ""             // gh:owner/repo when the event is about (or links to) a GitHub project
+    public var repoKey = ""             // gh:owner/repo when the event is about (or links to) a GitHub project: the project, not the event
+    public var facet = ""               // what happened to it: discover / release:<version> / article:<url> / page
     public var evidenceJSON: String?    // [EvidenceRef]：同一内容的各来源出处
     public var evidence: [EvidenceRef] {
         get { evidenceJSON.flatMap { try? JSONDecoder().decode([EvidenceRef].self, from: Data($0.utf8)) } ?? [] }
@@ -208,6 +209,9 @@ public final class Store {
         }
         m.registerMigration("v3") { db in
             try db.alter(table: "event") { t in t.add(column: "repoKey", .text).notNull().defaults(to: "") }
+        }
+        m.registerMigration("v4") { db in
+            try db.alter(table: "event") { t in t.add(column: "facet", .text).notNull().defaults(to: "") }
         }
         try m.migrate(db)
     }

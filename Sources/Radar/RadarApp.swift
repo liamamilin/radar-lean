@@ -50,6 +50,11 @@ struct MenuContent: View {
         Button("立即检查全部") { Task { await model.checkDue(force: true) } }.disabled(model.checking > 0)
         Toggle("暂停自动检查", isOn: $model.paused)
         SettingsLink { Text("设置…") }
+        if model.notifyStatus == .denied {
+            Button("系统通知已关闭 — 打开系统设置") {
+                NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.Notifications-Settings.extension")!)
+            }
+        }
         Divider()
         if model.recent.isEmpty { Text("暂无事件") }
         ForEach(model.recent, id: \.id) { e in

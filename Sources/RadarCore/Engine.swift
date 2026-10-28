@@ -7,6 +7,7 @@ public struct CheckOutcome {
     public var events: [Event] = []
     public var notModified = false
     public var error: String?
+    public var alreadyRunning = false   // another check of this source was in progress; nothing was fetched
 }
 
 public final class Engine {
@@ -16,11 +17,20 @@ public final class Engine {
 
     public init(store: Store, fetcher: Fetcher) { self.store = store; self.fetcher = fetcher }
 
+    /// Sources being read right now: a second request for the same source (timer tick, wake-up, a click) joins nothing and fetches nothing.
+    private let lock = NSLock()
+    private var inFlight = Set<Int64>()
+    public var onChecking: (@Sendable (Int64, Bool) -> Void)?   // UI hook: a source started / finished being read
+    public func isChecking(_ id: Int64) -> Bool { lock.withLock { inFlight.contains(id) } }
+
     enum Change { case new, changed(before: String), metrics(previous: [String: String]) }
 
     /// Fetch a source once and serve every linked watch from the result.
     @discardableResult
     public func check(sourceID: Int64) async -> CheckOutcome {
+        guard lock.withLock({ inFlight.insert(sourceID).inserted }) else { return CheckOutcome(alreadyRunning: true) }
+        onChecking?(sourceID, true)
+        defer { lock.withLock { _ = inFlight.remove(sourceID) }; onChecking?(sourceID, false) }
         guard let src = try? await store.db.read({ try Source.fetchOne($0, key: sourceID) }) else { return CheckOutcome(error: "来源不存在") }
         let spec = SourceSpec(kind: src.kind, endpoint: src.endpoint, name: src.name, selector: src.selector, interval: src.intervalSeconds)
         do {
@@ -97,14 +107,16 @@ public final class Engine {
                     switch change { case .new: type = "new"; case .changed: type = "changed"; case .metrics: type = "metrics" }
                     var mk = mergeKey(entry.canonicalURL)
                     if type == "changed" { mk += "#" + entry.contentHash }
-                    let rk = Self.repoKey(entry, kind: src.kind)
+                    let rk = Self.repoKey(entry, kind: src.kind, endpoint: src.endpoint)
+                    let facet = Self.facet(kind: src.kind, entry: entry, judged: j, mergeKey: mk)
                     let ref = EvidenceRef(name: src.name, url: entry.canonicalURL)
-                    // Already reported for this watch: same link / same GitHub project (within a week) / same title from another source
-                    // within 3 days. Add the evidence, no new event. A different version of the same page is NOT a duplicate (mk has its hash).
+                    // Already reported for this watch? Same link: yes. Same GitHub project AND same happening (discovery, one specific
+                    // release): yes, another source covering it. A different release or a new feature of that project is its own event,
+                    // as is another version of a page. Or the same title from another source within 3 days.
                     let wid = w.id!
                     var old = try Event.filter(Column("watchID") == wid && Column("mergeKey") == mk).fetchOne(db)
-                    if old == nil && !rk.isEmpty {
-                        old = try Event.filter(Column("watchID") == wid && (Column("mergeKey") == rk || Column("repoKey") == rk)
+                    if old == nil && !rk.isEmpty && (facet == "discover" || facet.hasPrefix("release:")) {
+                        old = try Event.filter(Column("watchID") == wid && Column("repoKey") == rk && Column("facet") == facet
                                                && Column("createdAt") > Date().addingTimeInterval(-7 * 86400)).fetchOne(db)
                     }
                     if old == nil && type == "new" && entry.title.count >= 15 {
@@ -115,13 +127,17 @@ public final class Engine {
                     if var old {
                         var ev = old.evidence
                         if !ev.contains(ref) { ev.append(ref); old.evidence = ev }
-                        if Self.rank(j.kind) > Self.rank(old.kind) { old.kind = j.kind; old.reason = j.reason }
+                        // an ordinary article that turns out to be about a new project / major update: promote it, and alert once
+                        let promoted = Self.rank(j.kind) > Self.rank(old.kind)
+                        let alertNow = promoted && Self.shouldNotify(plan: w.plan, kind: j.kind) && !Self.shouldNotify(plan: w.plan, kind: old.kind)
+                        if promoted { old.kind = j.kind; old.reason = j.reason }
                         try old.update(db)
+                        if alertNow { events.append(old) }
                         continue
                     }
                     var ev = Event(id: nil, watchID: w.id!, entryID: entry.id!, dedupeKey: sha256("\(w.id!)|\(mk)|\(type)"), title: entry.title, reason: j.reason,
                                    evidenceURL: entry.canonicalURL, beforeSnippet: j.before, afterSnippet: j.after, createdAt: Date(), readAt: nil,
-                                   kind: j.kind, mergeKey: mk, repoKey: rk)
+                                   kind: j.kind, mergeKey: mk, repoKey: rk, facet: facet)
                     ev.evidence = [ref]
                     try ev.insert(db)
                     events.append(ev)
@@ -144,16 +160,33 @@ public final class Engine {
 
     static let ghReserved: Set<String> = ["topics", "orgs", "sponsors", "features", "marketplace", "about", "login", "settings", "collections", "explore", "trending", "apps", "enterprise", "pricing", "readme"]
     /// The GitHub project an entry is (a repo page) or links to (first repo URL in its text).
-    static func repoKey(_ e: Entry, kind: SourceKind) -> String {
+    static func repoKey(_ e: Entry, kind: SourceKind, endpoint: String) -> String {
+        if kind == .githubReleases { return "gh:" + endpoint.lowercased() }
         let k = mergeKey(e.canonicalURL)
         if k.hasPrefix("gh:") { return k }
-        guard kind == .rss || kind == .list else { return "" }   // release notes link to their own repo; each release stays its own event
+        guard kind == .rss || kind == .list else { return "" }
         let hay = String((e.summary + " " + e.text).prefix(3000))   // not the URL itself: a release page must not collapse into its repo
         guard let r = hay.range(of: #"github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)"#, options: .regularExpression) else { return "" }
         let parts = hay[r].dropFirst("github.com/".count).split(separator: "/")
         guard parts.count == 2, !ghReserved.contains(parts[0].lowercased()) else { return "" }
         var repo = String(parts[1]); while repo.hasSuffix(".") { repo.removeLast() }; if repo.hasSuffix(".git") { repo.removeLast(4) }
         return "gh:" + (parts[0] + "/" + repo).lowercased()
+    }
+
+    /// What happened, as opposed to which project it happened to.
+    static func facet(kind: SourceKind, entry: Entry, judged j: Judged, mergeKey mk: String) -> String {
+        func ver(_ t: String) -> String? {
+            guard let r = t.range(of: #"\bv?\d+\.\d+(\.\d+)?(-[A-Za-z0-9.]+)?"#, options: .regularExpression), let v = Version(String(t[r])) else { return nil }
+            return v.nums.map(String.init).joined(separator: ".") + (v.pre.map { "-" + $0 } ?? "")
+        }
+        switch kind {
+        case .githubSearch: return "discover"
+        case .githubReleases: return "release:" + (ver(entry.meta["tag"] ?? entry.title) ?? entry.title.lowercased())
+        case .web: return "page"
+        case .rss, .list:
+            if j.kind == "majorUpdate", let v = ver(entry.title) { return "release:" + v }   // "Announcing v1.0" covers the v1.0 release
+            return j.kind == "update" ? "discover" : "article:" + mk                         // an ordinary post about a project is coverage of its discovery
+        }
     }
 
     static func rank(_ kind: String) -> Int { ["update": 0, "pageChange": 1, "majorUpdate": 2, "newProject": 3][kind] ?? 0 }

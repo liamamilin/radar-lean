@@ -6,12 +6,15 @@ final class Stub: URLProtocol {
     struct Resp { var status = 200; var headers: [String: String] = [:]; var body = Data(); var error: URLError? }
     nonisolated(unsafe) static var routes: [String: Resp] = [:]
     nonisolated(unsafe) static var hits: [String: Int] = [:]
+    nonisolated(unsafe) static var dynamic: ((URL) -> Resp?)?
+    nonisolated(unsafe) static var delay: TimeInterval = 0
     override class func canInit(with request: URLRequest) -> Bool { true }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
     override func startLoading() {
         let key = request.url!.absoluteString
         Stub.hits[key, default: 0] += 1
-        let r = Stub.routes.first { key.hasPrefix($0.key) }?.value ?? Resp(status: 404)
+        if Stub.delay > 0 { Thread.sleep(forTimeInterval: Stub.delay) }
+        let r = Stub.dynamic?(request.url!) ?? Stub.routes.first { key.hasPrefix($0.key) }?.value ?? Resp(status: 404)
         if let e = r.error { client?.urlProtocol(self, didFailWithError: e); return }
         let resp = HTTPURLResponse(url: request.url!, statusCode: r.status, httpVersion: nil, headerFields: r.headers)!
         client?.urlProtocol(self, didReceive: resp, cacheStoragePolicy: .notAllowed)
@@ -28,7 +31,7 @@ func fixture(_ name: String) -> Data {
 class Base: XCTestCase {
     var store: Store!, engine: Engine!
     override func setUp() async throws {
-        Stub.routes = [:]; Stub.hits = [:]
+        Stub.routes = [:]; Stub.hits = [:]; Stub.dynamic = nil; Stub.delay = 0
         let cfg = URLSessionConfiguration.ephemeral
         cfg.protocolClasses = [Stub.self]
         store = try Store(path: nil)
@@ -498,5 +501,95 @@ final class RegressionTests: Base {
         XCTAssertFalse(verdict("a/cad", "Parametric 3D CAD in Rust", topics: "mcp,cad", stars: 5000, forks: 400))     // tag only, not AI
         XCTAssertFalse(verdict("a/farm", "MCP server for everything", topics: "mcp", stars: 1200, forks: 5))          // 1200 stars, 5 forks
         XCTAssertFalse(verdict("a/empty", "", topics: "mcp", stars: 300, forks: 30))
+    }
+}
+
+final class StabilityTests: Base {
+    let searchURL = "https://api.github.com/search/repositories"
+    func ago(_ d: Double) -> String { Fetcher.iso.string(from: Date().addingTimeInterval(-d * 86400)) }
+    func repoJSON(_ stars: Int, age: Double) -> String {
+        #"{"items":[{"id":7,"full_name":"o/proj","html_url":"https://github.com/o/proj","description":"A small agent runtime","stargazers_count":\#(stars),"forks_count":3,"language":"Go","topics":[],"created_at":"\#(ago(age))","pushed_at":"\#(ago(0))","fork":false,"archived":false}]}"#
+    }
+    func rel(_ id: Int, _ tag: String) -> String { #"{"id":\#(id),"tag_name":"\#(tag)","name":"\#(tag)","html_url":"https://github.com/o/proj/releases/tag/\#(tag)","draft":false,"prerelease":false,"body":"Agent runtime notes. Full changelog https://github.com/o/proj/compare/a...b"}"# }
+    func feed(_ items: [(String, String)]) -> Data {
+        Data(("<?xml version=\"1.0\"?><rss version=\"2.0\"><channel><title>t</title>" + items.map { "<item><title>\($0.0)</title><link>https://blog.test/\($0.1)</link><description>see https://github.com/o/proj</description></item>" }.joined() + "</channel></rss>").utf8)
+    }
+
+    // one project, several things happening to it over days: each is its own event; coverage of the same thing joins it
+    func testSameProjectDifferentHappeningsStaySeparate() async throws {
+        var plan = WatchPlan(type: .topic, title: "t"); plan.include = ["agent"]; plan.minStars = 50
+        let (w, g) = try watch(plan, SourceSpec(kind: .githubSearch, endpoint: "topic:ai-agents", name: "search"))
+        let r = try store.attach(watchID: w.id!, spec: SourceSpec(kind: .githubReleases, endpoint: "o/proj", name: "releases"))
+        let b = try store.attach(watchID: w.id!, spec: SourceSpec(kind: .rss, endpoint: "https://blog.test/feed", name: "blog"))
+        let relURL = "https://api.github.com/repos/o/proj/releases"
+        Stub.routes[searchURL] = .init(body: Data(#"{"items":[]}"#.utf8)); Stub.routes[relURL] = .init(body: Data("[\(rel(1, "v0.9.0"))]".utf8))
+        Stub.routes["https://blog.test/feed"] = .init(body: feed([("old news", "old")]))
+        for id in [g.id!, r.id!, b.id!] { _ = await engine.check(sourceID: id) }
+
+        // day 1: discovered, and a blog post covers it
+        Stub.routes[searchURL] = .init(body: Data(repoJSON(80, age: 3).utf8))
+        var evs = await engine.check(sourceID: g.id!); XCTAssertEqual(evs.events.map { $0.kind }, ["newProject"])
+        Stub.routes["https://blog.test/feed"] = .init(body: feed([("Meet proj, a small runtime for agents", "meet"), ("old news", "old")]))
+        evs = await engine.check(sourceID: b.id!); XCTAssertEqual(evs.events.count, 0)                       // coverage of the discovery: merged
+        // day 2: v1.0.0 is released, and an announcement post
+        Stub.routes[relURL] = .init(body: Data("[\(rel(2, "v1.0.0")),\(rel(1, "v0.9.0"))]".utf8))
+        evs = await engine.check(sourceID: r.id!); XCTAssertEqual(evs.events.count, 1)                       // not swallowed by the discovery event
+        Stub.routes["https://blog.test/feed"] = .init(body: feed([("Announcing proj v1.0 for agent builders", "v1"), ("Meet proj, a small runtime for agents", "meet"), ("old news", "old")]))
+        evs = await engine.check(sourceID: b.id!); XCTAssertEqual(evs.events.count, 0)                       // same happening: merged
+        // day 3: a new minor release and a launch post about a feature (no version in it)
+        Stub.routes[relURL] = .init(body: Data("[\(rel(3, "v1.1.0")),\(rel(2, "v1.0.0")),\(rel(1, "v0.9.0"))]".utf8))
+        evs = await engine.check(sourceID: r.id!); XCTAssertEqual(evs.events.count, 1)
+        Stub.routes["https://blog.test/feed"] = .init(body: feed([("proj launch: agent memory is here", "mem"), ("Announcing proj v1.0 for agent builders", "v1"), ("Meet proj, a small runtime for agents", "meet"), ("old news", "old")]))
+        evs = await engine.check(sourceID: b.id!); XCTAssertEqual(evs.events.count, 1)                       // a different happening of the same project
+        // re-reading everything changes nothing
+        for id in [g.id!, r.id!, b.id!] { let o = await engine.check(sourceID: id); XCTAssertEqual(o.events.count, 0) }
+        let all = try events()
+        XCTAssertEqual(all.count, 4)                                                                         // discovery, v1.0.0, v1.1.0, feature post
+        XCTAssertEqual(all.map { $0.evidence.count }, [2, 2, 1, 1])                                         // discovery+blog, v1.0.0+announcement
+    }
+
+    // timer tick, wake-up and a click arriving while a source is being read: one request
+    func testOverlappingChecksFetchOnce() async throws {
+        let (_, s) = try watch(WatchPlan(type: .feed, title: "f"), SourceSpec(kind: .rss, endpoint: "https://slow.test/feed", name: "slow"))
+        Stub.routes["https://slow.test/feed"] = .init(body: feed([("a", "a")])); Stub.delay = 0.6
+        async let a = engine.check(sourceID: s.id!), b = engine.check(sourceID: s.id!), c = engine.check(sourceID: s.id!)
+        let outs = await [a, b, c]
+        XCTAssertEqual(outs.filter { $0.alreadyRunning }.count, 2)
+        XCTAssertEqual(Stub.hits["https://slow.test/feed"], 1)
+        XCTAssertFalse(engine.isChecking(s.id!))                                                             // finished: free for the next run
+        Stub.delay = 0
+        let again = await engine.check(sourceID: s.id!); XCTAssertFalse(again.alreadyRunning)
+        let due = try store.sync { try Source.fetchOne($0, key: s.id!)!.nextDueAt }
+        XCTAssertGreaterThan(due, Date())                                                                    // next run scheduled
+    }
+
+    // a topic whose only project is 5 days old with 8 stars is still a working source; the normal case costs one request
+    func testSampleSearchFallsBackToFreshWindow() async throws {
+        let cfg = URLSessionConfiguration.ephemeral; cfg.protocolClasses = [Stub.self]
+        let f = Fetcher(session: URLSession(configuration: cfg)); f.searchGap = 0
+        let disc = Discovery(fetcher: f, store: store)
+        Stub.dynamic = { url in
+            let q = url.absoluteString.removingPercentEncoding ?? ""
+            return .init(body: Data((q.contains("30..400") ? #"{"items":[]}"# : self.repoJSON(8, age: 5)).utf8))
+        }
+        let spec = SourceSpec(kind: .githubSearch, endpoint: "topic:tiny", name: "tiny")
+        let c = await disc.probe(spec)
+        XCTAssertTrue(c.ok); XCTAssertEqual(c.samples, ["• o/proj"].map { String($0.dropFirst(2)) })
+        XCTAssertEqual(Stub.hits.values.reduce(0, +), 2)                                                     // the cheap query, then the fresh window
+        Stub.hits = [:]; Stub.dynamic = { _ in .init(body: Data(self.repoJSON(100, age: 30).utf8)) }
+        _ = await disc.probe(spec)
+        XCTAssertEqual(Stub.hits.values.reduce(0, +), 1)                                                     // no fallback when the first query finds something
+    }
+
+    // scheduled checks read the sources directly; the web search API is for discovery only
+    func testScheduledChecksDoNotCallSearch() async throws {
+        let cfg = URLSessionConfiguration.ephemeral; cfg.protocolClasses = [Stub.self]
+        let f = Fetcher(session: URLSession(configuration: cfg), searchKey: { "k" }); f.searchGap = 0
+        let eng = Engine(store: store, fetcher: f)
+        _ = try watch(WatchPlan(type: .feed, title: "f"), SourceSpec(kind: .rss, endpoint: "https://a.test/feed", name: "a"))
+        Stub.routes["https://a.test/feed"] = .init(body: feed([("x", "x")]))
+        _ = await eng.checkDue(force: true); _ = await eng.checkDue(force: true)
+        XCTAssertTrue(Stub.hits.keys.allSatisfy { !$0.contains("exa.ai") })
+        XCTAssertEqual(Stub.hits["https://a.test/feed"], 2)
     }
 }

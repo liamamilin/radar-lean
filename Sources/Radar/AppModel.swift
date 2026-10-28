@@ -3,6 +3,7 @@ import RadarCore
 import GRDB
 import UserNotifications
 import Security
+import os
 
 enum Keychain {
     static let service = "app.radar.github-token"
@@ -34,6 +35,10 @@ final class AppModel: NSObject, ObservableObject, UNUserNotificationCenterDelega
         didSet { UserDefaults.standard.set(paused, forKey: "paused") }
     }
     @Published var unread = 0
+    @Published var notifyStatus = UNAuthorizationStatus.notDetermined   // what macOS currently allows us to show
+    private let notifyLog = Logger(subsystem: "app.radar", category: "notify")
+    @Published var busySources = Set<Int64>()   // sources being read right now (shown in the source rows)
+    private var sweeping = false
     @Published var driveNL: String?   // dev aid (RADAR_DRIVE_*): a natural-language edit to apply to the open watch
     @Published var recent: [Event] = []
     private var observer: AnyDatabaseCancellable?
@@ -50,6 +55,9 @@ final class AppModel: NSObject, ObservableObject, UNUserNotificationCenterDelega
         discovery = Discovery(fetcher: fetcher, store: store)
         super.init()
         tokenBox.value = ProcessInfo.processInfo.environment["GITHUB_TOKEN"] ?? (isolated ? nil : Keychain.get())
+        engine.onChecking = { [weak self] id, on in
+            DispatchQueue.main.async { if on { self?.busySources.insert(id) } else { self?.busySources.remove(id) } }
+        }
         self.tokenBox = tokenBox
         searchBox.value = ProcessInfo.processInfo.environment["EXA_API_KEY"] ?? (isolated ? nil : Keychain.get(Keychain.searchService))
         self.searchBox = searchBox
@@ -59,7 +67,16 @@ final class AppModel: NSObject, ObservableObject, UNUserNotificationCenterDelega
             })
         changed()
         UNUserNotificationCenter.current().delegate = self
-        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
+        // ask once the app is up and active: an early request (inside init) is refused with "not allowed"
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
+            UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { granted, error in
+                self?.notifyLog.notice("authorization granted=\(granted) error=\(String(describing: error), privacy: .public)")
+                Task { @MainActor in await self?.refreshNotifyStatus() }
+            }
+        }
+        NotificationCenter.default.addObserver(forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main) { [weak self] _ in
+            Task { @MainActor in await self?.refreshNotifyStatus() }   // the user may have changed it in System Settings
+        }
         timer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
             Task { @MainActor in await self?.checkDue() }
         }
@@ -82,6 +99,8 @@ final class AppModel: NSObject, ObservableObject, UNUserNotificationCenterDelega
 
     func checkDue(force: Bool = false) async {
         if paused && !force { return }
+        guard !sweeping else { return }            // the previous sweep (timer / wake-up / menu) is still running
+        sweeping = true; defer { sweeping = false }
         checking += 1; defer { checking -= 1 }
         notify(await engine.checkDue(force: force))
     }
@@ -96,13 +115,19 @@ final class AppModel: NSObject, ObservableObject, UNUserNotificationCenterDelega
         notify(await engine.check(sourceID: sourceID).events)
     }
 
+    func refreshNotifyStatus() async {
+        notifyStatus = await UNUserNotificationCenter.current().notificationSettings().authorizationStatus
+    }
+
     func notify(_ events: [Event]) {
         let watches = (try? store.db.read { try Watch.fetchAll($0) }) ?? []
         for e in events {
             guard let plan = watches.first(where: { $0.id == e.watchID })?.plan, Engine.shouldNotify(plan: plan, kind: e.kind) else { continue }
             let c = UNMutableNotificationContent()
             c.title = e.title; c.body = e.reason; c.userInfo = ["url": e.evidenceURL]
-            UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: e.dedupeKey, content: c, trigger: nil))
+            UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: e.dedupeKey, content: c, trigger: nil)) { [notifyLog] error in
+                notifyLog.notice("submitted \(e.kind) '\(e.title)' error=\(String(describing: error), privacy: .public)")
+            }
         }
     }
 

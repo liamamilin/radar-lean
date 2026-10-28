@@ -152,7 +152,10 @@ public final class Fetcher {
 
     /// One cheap query, enough to tell a candidate source works and show samples.
     public func sampleSearch(_ query: String) async throws -> FetchResult {
-        FetchResult(entries: try await searchRepos(query, days: 90, stars: "30..400", perPage: 20), title: query)
+        var items = try await searchRepos(query, days: 90, stars: "30..400", perPage: 20)
+        // a topic whose only projects are days old with a handful of stars is a working source too
+        if items.isEmpty { items = try await searchRepos(query, days: 14, stars: ">=5", perPage: 20) }
+        return FetchResult(entries: items, title: query)
     }
 
     func searchRepos(_ query: String, days: Int, stars: String, perPage: Int) async throws -> [FetchedEntry] {

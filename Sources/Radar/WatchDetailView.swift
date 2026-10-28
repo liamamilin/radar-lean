@@ -86,7 +86,8 @@ struct WatchDetailView: View {
                 Text(s.kind.label).font(.caption).padding(.horizontal, 6).background(.quaternary, in: Capsule())
                 Spacer()
                 intervalPicker(s)
-                Button("检查") { Task { await model.check(sourceID: s.id!) } }.disabled(model.checking > 0)
+                if model.busySources.contains(s.id!) { ProgressView().controlSize(.small); Text("检查中…").font(.caption) }
+                else { Button("检查") { Task { await model.check(sourceID: s.id!) } } }
                 Button { try? model.store.detach(watchID: watchID, sourceID: s.id!) } label: { Image(systemName: "minus.circle") }.help("从这个关注里移除此来源")
             }
             Text(s.endpoint).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
