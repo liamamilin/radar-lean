@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "description": "仅供开发 Agent 生成应用内 SeedSources.json 的示例。所有来源在实际启用前必须在线 probe。",
+  "topics": [
+    {
+      "id": "ai-open-source",
+      "displayName": "AI 开源项目",
+      "keywords": ["AI", "LLM", "Agent", "local model"],
+      "candidates": [
+        {
+          "kind": "github_repository_search",
+          "name": "GitHub · AI Agent 主题",
+          "query": "topic:ai-agents",
+          "checkIntervalSeconds": 43200
+        },
+        {
+          "kind": "github_repository_search",
+          "name": "GitHub · 本地 LLM 主题",
+          "query": "topic:local-llm",
+          "checkIntervalSeconds": 43200
+        }
+      ]
+    }
+  ]
+}

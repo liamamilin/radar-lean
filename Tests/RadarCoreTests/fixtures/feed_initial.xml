@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0"><channel>
+  <title>Radar Sample Developer Feed</title>
+  <link>https://example.com/blog</link>
+  <description>Fixture data for automated tests only.</description>
+  <item><guid isPermaLink="false">post-100</guid><title>Writing reliable Swift tests</title>
+    <link>https://example.com/blog/100</link>
+    <description>Practical test patterns.</description>
+    <pubDate>Mon, 26 Oct 2026 12:00:00 GMT</pubDate>
+  </item>
+</channel></rss>
