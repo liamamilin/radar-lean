@@ -204,6 +204,12 @@ final class PersistenceTests: Base {
 }
 
 final class PlanTests: XCTestCase {
+    /// Without the on-device model the rules alone must still find the listed names and a usable title.
+    func testListedProductsWithoutModel() {
+        let p = PlanParser.parse("我想要关注, chatgpt , claude ,codex , claude code  等等顶级模型和工具的的最新信息")
+        XCTAssertEqual(p.include, ["chatgpt", "claude", "codex", "claude code"])
+        XCTAssertEqual(p.title, "chatgpt / claude / codex 动态")
+    }
     func testTopic() {
         let p = PlanParser.parse("关注 AI 开源项目，尤其是 Agent 和本地模型，排除 AI 绘画")
         XCTAssertEqual(p.type, .topic); XCTAssertEqual(p.include, ["Agent", "本地模型"]); XCTAssertEqual(p.exclude, ["AI 绘画"])

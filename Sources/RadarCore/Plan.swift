@@ -135,12 +135,18 @@ public enum PlanParser {
            plan.include.isEmpty, let about = clause(after: ["关于", "about "], in: t) {
             plan.include = splitList(about.replacingOccurrences(of: "的新文章", with: "").replacingOccurrences(of: "有", with: "")).filter { $0.count < 24 }
         }
+        if plan.type == .topic, plan.include.isEmpty, let list = clause(after: ["关注", "关于", "follow ", "watch "], in: t) {
+            // "关注 a, b, c 等等…的最新信息": keep the listed names, drop the trailing description
+            plan.include = splitList(list).map { $0.components(separatedBy: "等").first ?? $0 }
+                .map { $0.trimmingCharacters(in: .whitespaces) }.filter { w in !w.isEmpty && w.count < 24 && w.allSatisfy(\.isASCII) }
+            if plan.title == "新关注", !plan.include.isEmpty { plan.title = plan.include.prefix(3).joined(separator: " / ") + " 动态" }
+        }
         return plan
     }
 
     static func topicTitle(_ t: String) -> String {
         var s = t
-        for p in ["我想持续关注", "我想关注", "持续关注", "请关注", "关注", "follow ", "watch "] {
+        for p in ["我想持续关注", "我想要关注", "我想关注", "持续关注", "请关注", "关注", "follow ", "watch "] {
             if let r = s.range(of: p, options: [.anchored, .caseInsensitive]) { s = String(s[r.upperBound...]); break }
         }
         if let i = s.firstIndex(where: { "，,。.；;".contains($0) }) { s = String(s[..<i]) }
