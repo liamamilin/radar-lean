@@ -12,10 +12,21 @@ final class AssistantModel: ObservableObject {
     @Published var selectedName = UserDefaults.standard.string(forKey: "ollamaModel") {
         didSet { UserDefaults.standard.set(selectedName, forKey: "ollamaModel") }
     }
-    struct Cached { var text: String; var evidence: [Evidence]; var signature: String; var model: String; var date: Date }
-    var summaries: [String: Cached] = [:]
+    struct Cached: Codable { var text: String; var evidence: [Evidence]; var signature: String; var model: String; var date: Date }
+    private let store: Store
+    private(set) var summaries: [String: Cached] = [:]
 
-    init(store: Store) { assistant = RadarAssistant(store: store) }
+    init(store: Store) {
+        self.store = store; assistant = RadarAssistant(store: store)
+        let rows = (try? store.db.read { try Row.fetchAll($0, sql: "SELECT key, json FROM summaryCache") }) ?? []
+        for r in rows { if let k: String = r["key"], let d: Data = r["json"], let c = try? JSONDecoder().decode(Cached.self, from: d) { summaries[k] = c } }
+    }
+
+    func save(_ key: String, _ c: Cached) {
+        summaries[key] = c
+        guard let d = try? JSONEncoder().encode(c) else { return }
+        try? store.db.write { try $0.execute(sql: "INSERT OR REPLACE INTO summaryCache (key, json) VALUES (?, ?)", arguments: [key, d]) }
+    }
 
     var selected: OllamaModel? { models.first { $0.name == selectedName } ?? models.first { !$0.thinking } ?? models.first }
 
@@ -43,7 +54,7 @@ struct MarkdownText: View {
                     HStack(alignment: .top, spacing: 6) { Text("•"); Text(inline(b)) }
                 } else { Text(inline(line)) }
             }
-        }.textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
+        }.frame(maxWidth: .infinity, alignment: .leading)   // no .textSelection: it swallows link clicks on macOS
     }
     func bullet(_ l: String) -> Substring? {
         let t = l.drop { $0 == " " }
@@ -157,7 +168,7 @@ struct SummaryPanel: View {
                 evidence = ctx.evidence
                 if ctx.evidence.isEmpty { text = "这个范围内还没有采集到内容（\(range.label)）。可以换一个更长的时间范围，或先点“立即检查”。"; return }
                 for try await piece in ai.client.chat(model: m, messages: RadarAssistant.summaryMessages(ctx, range: range)) { text += piece }
-                if !stopped && !text.isEmpty { ai.summaries[key] = .init(text: text, evidence: ctx.evidence, signature: ctx.signature, model: m.name, date: Date()); generatedAt = Date() }
+                if !stopped && !text.isEmpty { ai.save(key, .init(text: text, evidence: ctx.evidence, signature: ctx.signature, model: m.name, date: Date())); generatedAt = Date() }
             } catch is CancellationError {} catch { self.error = error.localizedDescription }
         }
     }

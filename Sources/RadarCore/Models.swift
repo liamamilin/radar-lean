@@ -213,6 +213,9 @@ public final class Store {
         m.registerMigration("v4") { db in
             try db.alter(table: "event") { t in t.add(column: "facet", .text).notNull().defaults(to: "") }
         }
+        m.registerMigration("v5") { db in   // generated AI summaries survive restarts
+            try db.create(table: "summaryCache") { t in t.primaryKey("key", .text); t.column("json", .blob).notNull() }
+        }
         try m.migrate(db)
     }
 

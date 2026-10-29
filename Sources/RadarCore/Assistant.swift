@@ -12,7 +12,7 @@ public enum TimeRange: String, CaseIterable, Identifiable {
 }
 
 /// One numbered piece of stored material handed to the model. The URL always comes from the database.
-public struct Evidence: Identifiable, Hashable {
+public struct Evidence: Identifiable, Hashable, Codable {
     public var id: String            // S1, S2 …
     public var title: String
     public var url: String
