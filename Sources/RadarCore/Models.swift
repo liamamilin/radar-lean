@@ -216,6 +216,12 @@ public final class Store {
         m.registerMigration("v5") { db in   // generated AI summaries survive restarts
             try db.create(table: "summaryCache") { t in t.primaryKey("key", .text); t.column("json", .blob).notNull() }
         }
+        m.registerMigration("v6") { db in   // keep every generated summary, not just the latest
+            try db.create(table: "summaryHistory") { t in
+                t.autoIncrementedPrimaryKey("id"); t.column("key", .text).notNull().indexed(); t.column("json", .blob).notNull()
+            }
+            try db.execute(sql: "INSERT INTO summaryHistory (key, json) SELECT key, json FROM summaryCache")
+        }
         try m.migrate(db)
     }
 

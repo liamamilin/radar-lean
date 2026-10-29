@@ -14,18 +14,25 @@ final class AssistantModel: ObservableObject {
     }
     struct Cached: Codable { var text: String; var evidence: [Evidence]; var signature: String; var model: String; var date: Date }
     private let store: Store
-    private(set) var summaries: [String: Cached] = [:]
+    static let keepPerKey = 20
+    /// Every generated summary per "<watch>|<range>", newest first. The first one is the cache.
+    private(set) var history: [String: [Cached]] = [:]
+    func latest(_ key: String) -> Cached? { history[key]?.first }
 
     init(store: Store) {
         self.store = store; assistant = RadarAssistant(store: store)
-        let rows = (try? store.db.read { try Row.fetchAll($0, sql: "SELECT key, json FROM summaryCache") }) ?? []
-        for r in rows { if let k: String = r["key"], let d: Data = r["json"], let c = try? JSONDecoder().decode(Cached.self, from: d) { summaries[k] = c } }
+        let rows = (try? store.db.read { try Row.fetchAll($0, sql: "SELECT key, json FROM summaryHistory ORDER BY id") }) ?? []
+        for r in rows { if let k: String = r["key"], let d: Data = r["json"], let c = try? JSONDecoder().decode(Cached.self, from: d) { history[k, default: []].insert(c, at: 0) } }
     }
 
     func save(_ key: String, _ c: Cached) {
-        summaries[key] = c
+        history[key, default: []].insert(c, at: 0)
+        if history[key]!.count > Self.keepPerKey { history[key]!.removeLast(history[key]!.count - Self.keepPerKey) }
         guard let d = try? JSONEncoder().encode(c) else { return }
-        try? store.db.write { try $0.execute(sql: "INSERT OR REPLACE INTO summaryCache (key, json) VALUES (?, ?)", arguments: [key, d]) }
+        try? store.db.write { db in
+            try db.execute(sql: "INSERT INTO summaryHistory (key, json) VALUES (?, ?)", arguments: [key, d])
+            try db.execute(sql: "DELETE FROM summaryHistory WHERE key = ? AND id NOT IN (SELECT id FROM summaryHistory WHERE key = ? ORDER BY id DESC LIMIT ?)", arguments: [key, key, Self.keepPerKey])
+        }
     }
 
     var selected: OllamaModel? { models.first { $0.name == selectedName } ?? models.first { !$0.thinking } ?? models.first }
@@ -118,6 +125,7 @@ struct SummaryPanel: View {
     @State private var stopped = false
     @State private var stale = false
     @State private var generatedAt: Date?
+    @State private var older = false   // showing an earlier summary from the history
     @State private var task: Task<Void, Never>?
 
     var key: String { "\(watchID ?? 0)|\(range.rawValue)" }
@@ -129,8 +137,16 @@ struct SummaryPanel: View {
                 if busy { Button("停止") { stopped = true; task?.cancel() }; ProgressView().controlSize(.small) }
                 else { Button(text.isEmpty ? "生成总结" : "重新生成") { generate() }.disabled(ai.selected == nil) }
                 ModelMenu(ai: ai)
+                if let h = ai.history[key], h.count > 1 {
+                    Menu("历史（\(h.count)）") {
+                        ForEach(Array(h.enumerated()), id: \.offset) { i, c in
+                            Button(c.date.formatted(date: .abbreviated, time: .shortened) + " · " + c.model + (i == 0 ? "（最新）" : "")) { show(c, latest: i == 0) }
+                        }
+                    }.fixedSize()
+                }
             }
             OllamaNotice(ai: ai)
+            if older && !busy { Label("正在查看较早的一次总结", systemImage: "clock.arrow.circlepath").font(.caption).foregroundStyle(.secondary) }
             if let error { Label(error, systemImage: "xmark.octagon").font(.caption).foregroundStyle(.red) }
             if stale && !busy { Label("数据有更新，可重新生成", systemImage: "arrow.triangle.2.circlepath").font(.caption).foregroundStyle(.blue) }
             if stopped { Text("已停止，以下为已生成的部分").font(.caption).foregroundStyle(.secondary) }
@@ -149,17 +165,20 @@ struct SummaryPanel: View {
 
     func loadCached() async {
         task?.cancel(); busy = false; stopped = false; error = nil
-        if let c = ai.summaries[key] {
-            text = c.text; evidence = c.evidence; generatedAt = c.date
-            let sig = try? ai.assistant.summaryContext(watchID: watchID, range: range).signature
-            stale = sig != nil && sig != c.signature
-        } else { text = ""; evidence = []; generatedAt = nil; stale = false }
+        older = false
+        if let c = ai.latest(key) { show(c, latest: true) } else { text = ""; evidence = []; generatedAt = nil; stale = false }
+    }
+
+    func show(_ c: AssistantModel.Cached, latest: Bool) {
+        text = c.text; evidence = c.evidence; generatedAt = c.date; older = !latest; stopped = false; error = nil
+        let sig = latest ? (try? ai.assistant.summaryContext(watchID: watchID, range: range).signature) : nil
+        stale = latest && sig != nil && sig != c.signature
     }
 
     func generate() {
         guard let m = ai.selected else { return }
         let key = key, wid = watchID, range = range
-        task?.cancel(); text = ""; evidence = []; error = nil; stopped = false; busy = true; stale = false
+        task?.cancel(); text = ""; evidence = []; error = nil; stopped = false; busy = true; stale = false; older = false
         task = Task {
             defer { busy = false }
             do {

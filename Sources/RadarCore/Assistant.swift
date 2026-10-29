@@ -231,7 +231,7 @@ public final class RadarAssistant {
             guard let whole = Range(m.range, in: out), let inner = Range(m.range(at: 1), in: out) else { continue }
             let ids = out[inner].split(whereSeparator: { !($0.isLetter || $0.isNumber) }).map(String.init)
             let links = ids.map { id in byID[id].flatMap { URL(string: $0) != nil ? "[\(id)](\($0))" : nil } ?? "\(id)" }
-            out.replaceSubrange(whole, with: links.joined(separator: " "))
+            out.replaceSubrange(whole, with: links.joined(separator: "、"))
         }
         return out
     }
