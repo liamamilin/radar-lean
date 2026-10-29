@@ -120,7 +120,7 @@ public final class Fetcher {
 
     func fetchReleases(_ repo: String, cond: [String: String]) async throws -> FetchResult {
         let url = URL(string: "\(githubBase)/repos/\(repo)/releases?per_page=30")!
-        let r = try await get(url, headers: githubHeaders().merging(cond) { $1 })
+        let r = try await get(url, headers: githubHeaders().merging(cond) { $1 }, maxBytes: 25_000_000)   // release notes can be huge (openai/codex)
         if r.status == 304 { return FetchResult(entries: [], notModified: true, etag: cond["If-None-Match"], lastModified: cond["If-Modified-Since"]) }
         try check(r, allow304: true)
         guard let arr = try JSONSerialization.jsonObject(with: r.data) as? [[String: Any]] else { throw RadarError.parse("Releases 响应格式不符") }
