@@ -29,6 +29,7 @@ final class AppModel: NSObject, ObservableObject, UNUserNotificationCenterDelega
     let engine: Engine
     let discovery: Discovery
     let ai: AssistantModel
+    let isolated = ProcessInfo.processInfo.environment["RADAR_DB"] != nil
     var token: String?
     @Published var revision = 0
     @Published var checking = 0

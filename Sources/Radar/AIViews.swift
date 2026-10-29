@@ -249,14 +249,15 @@ struct AskRadarView: View {
         input = ""; busy = true
         let history = turns.filter { $0.done && !$0.answer.isEmpty }.flatMap { [ChatMessage(role: "user", content: $0.question), ChatMessage(role: "assistant", content: $0.answer)] }
         let a = model.ai.assistant, prev = evidence, wid = scope, rg = range, title = scopeTitle
-        turns.append(Turn(question: q)); let idx = turns.count - 1
+        let turn = Turn(question: q); turns.append(turn)
+        func update(_ f: (inout Turn) -> Void) { if let i = turns.firstIndex(where: { $0.id == turn.id }) { f(&turns[i]) } }   // "新对话" may have removed it
         task = Task {
-            defer { busy = false; turns[idx].done = true }
+            defer { busy = false; update { $0.done = true } }
             do {
                 let ev = try await Task.detached { try a.askContext(question: q, watchID: wid, range: rg, previous: prev) }.value
-                evidence = ev; turns[idx].evidence = ev
-                for try await piece in model.ai.client.chat(model: m, messages: RadarAssistant.askMessages(history: history, question: q, evidence: ev, scope: title)) { turns[idx].answer += piece }
-            } catch is CancellationError {} catch { turns[idx].failed = error.localizedDescription }
+                evidence = ev; update { $0.evidence = ev }
+                for try await piece in model.ai.client.chat(model: m, messages: RadarAssistant.askMessages(history: history, question: q, evidence: ev, scope: title)) { update { $0.answer += piece } }
+            } catch is CancellationError {} catch { update { $0.failed = error.localizedDescription } }
         }
     }
 }

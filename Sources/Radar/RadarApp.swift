@@ -20,8 +20,8 @@ struct RadarApp: App {
 
 struct SettingsView: View {
     @EnvironmentObject var model: AppModel
-    @State private var token = Keychain.get() ?? ""
-    @State private var searchKey = Keychain.get(Keychain.searchService) ?? ""
+    @State private var token = ""
+    @State private var searchKey = ""
     @State private var saved = false
     var body: some View {
         Form {
@@ -42,6 +42,10 @@ struct SettingsView: View {
             }
         }
         .formStyle(.grouped).frame(width: 520, height: 470)
+        .onAppear {   // a scratch database (RADAR_DB) never touches the real Keychain
+            guard !model.isolated else { return }
+            token = Keychain.get() ?? ""; searchKey = Keychain.get(Keychain.searchService) ?? ""
+        }
     }
 }
 
@@ -71,6 +75,9 @@ struct MenuContent: View {
 struct OllamaSettings: View {
     @ObservedObject var ai: AssistantModel
     var body: some View {
+        Group { content }.task { await ai.refresh() }
+    }
+    @ViewBuilder var content: some View {
         HStack {
             switch ai.status {
             case .ready: Label("已连接，\(ai.models.count) 个本地模型", systemImage: "checkmark.circle.fill").foregroundStyle(.green)
