@@ -7,7 +7,7 @@ struct RadarApp: App {
 
     var body: some Scene {
         Window("Radar", id: "main") {
-            ContentView().environmentObject(model).frame(minWidth: 900, minHeight: 560)
+            ContentView().environmentObject(model).radarLinks().frame(minWidth: 900, minHeight: 560)
         }
         MenuBarExtra {
             MenuContent().environmentObject(model)
