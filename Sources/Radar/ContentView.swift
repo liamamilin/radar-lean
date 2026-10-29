@@ -40,7 +40,7 @@ struct ContentView: View {
         }
         .toolbar {
             ToolbarItem {
-                Button { exportSources() } label: { Label("导出信息源", systemImage: "square.and.arrow.up") }.help("把所有信息源导出为 JSON 文件")
+                Button { Self.exportSources(model.store) } label: { Label("导出信息源", systemImage: "square.and.arrow.up") }.help("把所有信息源导出为 JSON 文件")
             }
             ToolbarItem {
                 Button { Task { await model.checkDue(force: true) } } label: {
@@ -70,8 +70,8 @@ struct ContentView: View {
         }
     }
 
-    func exportSources() {
-        guard let data = try? model.store.exportSources() else { return }
+    static func exportSources(_ store: Store) {
+        guard let data = try? store.exportSources() else { return }
         let panel = NSSavePanel()
         panel.nameFieldStringValue = "Radar-信息源-\(Date().formatted(.iso8601.year().month().day())).json"
         panel.allowedContentTypes = [.json]

@@ -61,6 +61,7 @@ struct WatchDetailView: View {
                 }
                 Section("信息源") {
                     ForEach(sources) { s in sourceRow(s) }
+                    Button { ContentView.exportSources(model.store) } label: { Label("导出全部信息源（JSON）", systemImage: "square.and.arrow.up") }
                     HStack {
                         TextField("添加来源 URL（GitHub 仓库 / RSS / 网页）", text: $addURL).onSubmit(addSource)
                         Button("添加", action: addSource).disabled(addURL.isEmpty)
