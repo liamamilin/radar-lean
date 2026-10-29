@@ -6,6 +6,16 @@
 - 日常采集不需要任何 API Key，也不调用任何 AI；AI 只在你点击时运行，并且只用本机 Ollama。
 - 当前版本：**V0.2**（macOS 15+）。
 
+## 界面
+
+![AI 简报：事件与已发现内容分开，每条结论带可点击的来源编号](docs/images/briefing.png)
+
+![关注详情：条件、通知、AI 总结、信息源](docs/images/watch.png)
+
+![问 Radar：基于本地已采集内容回答，列出来源](docs/images/ask.png)
+
+> 截图来自真实运行（本机 Ollama，模型 qwen3.8:27b-mlx，关注“chatgpt / claude / codex 动态”）。问答截图里模型把一些新闻条目也当成了“项目”，这是已知限制，见文末。
+
 ## 它能做什么
 
 **1. 用一句话建立关注**
