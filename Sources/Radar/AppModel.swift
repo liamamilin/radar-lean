@@ -28,6 +28,7 @@ final class AppModel: NSObject, ObservableObject, UNUserNotificationCenterDelega
     let store: Store
     let engine: Engine
     let discovery: Discovery
+    let ai: AssistantModel
     var token: String?
     @Published var revision = 0
     @Published var checking = 0
@@ -53,6 +54,7 @@ final class AppModel: NSObject, ObservableObject, UNUserNotificationCenterDelega
         let fetcher = Fetcher(githubToken: { tokenBox.value }, searchKey: { searchBox.value })
         engine = Engine(store: store, fetcher: fetcher)
         discovery = Discovery(fetcher: fetcher, store: store)
+        ai = AssistantModel(store: store)
         super.init()
         tokenBox.value = ProcessInfo.processInfo.environment["GITHUB_TOKEN"] ?? (isolated ? nil : Keychain.get())
         engine.onChecking = { [weak self] id, on in

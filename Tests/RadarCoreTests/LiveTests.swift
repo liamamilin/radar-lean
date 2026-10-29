@@ -153,3 +153,31 @@ final class RecheckTests: XCTestCase {
         again: do { let r = await engine.check(watchID: w.id!); XCTAssertEqual(r.count, 0) }    // and an immediate re-check stays quiet
     }
 }
+
+/// RADAR_OLLAMA=<model> RADAR_DB_COPY=<copy of a real radar.sqlite>: real local model over real collected data. Prints the answers to RADAR_OLLAMA_OUT.
+final class OllamaLiveTests: XCTestCase {
+    func testSummaryAndConversation() async throws {
+        let env = ProcessInfo.processInfo.environment
+        guard let name = env["RADAR_OLLAMA"], let path = env["RADAR_DB_COPY"] else { throw XCTSkip("set RADAR_OLLAMA and RADAR_DB_COPY") }
+        let store = try Store(path: path), a = RadarAssistant(store: store), c = OllamaClient()
+        let models = try await c.models()
+        let m = try XCTUnwrap(models.first { $0.name == name })
+        var out = "MODEL \(m.name) thinking=\(m.thinking)\n"
+        func run(_ msgs: [ChatMessage]) async throws -> String {
+            var t = ""; for try await p in c.chat(model: m, messages: msgs) { t += p }; return t
+        }
+        let ctx = try a.summaryContext(watchID: nil, range: .week)
+        out += "\n## SUMMARY (events \(ctx.events), entries in range \(ctx.entries), shown \(ctx.evidence.count))\n"
+        let s = try await run(RadarAssistant.summaryMessages(ctx, range: .week)); out += s + "\n"
+        out += "\nCITED: " + RadarAssistant.cited(s, ctx.evidence).map { "\($0.id) \($0.url)" }.joined(separator: " | ") + "\n"
+        var ev: [Evidence] = [], hist: [ChatMessage] = []
+        for q in ["最近发现了哪些值得关注的 Agent 项目？", "其中哪些值得进一步研究？", "比较前两个项目。"] {
+            ev = try a.askContext(question: q, watchID: nil, range: nil, previous: ev)
+            let ans = try await run(RadarAssistant.askMessages(history: hist, question: q, evidence: ev, scope: "全部关注事项"))
+            hist += [ChatMessage(role: "user", content: q), ChatMessage(role: "assistant", content: ans)]
+            out += "\n## Q: \(q)  (evidence \(ev.count))\n\(ans)\n"
+            out += "EVIDENCE: " + ev.map { "\($0.id)=\($0.title)" }.joined(separator: "; ") + "\n"
+        }
+        try out.write(toFile: env["RADAR_OLLAMA_OUT"] ?? "/tmp/ollama-live.txt", atomically: true, encoding: .utf8)
+    }
+}

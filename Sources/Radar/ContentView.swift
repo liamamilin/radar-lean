@@ -2,7 +2,7 @@ import SwiftUI
 import RadarCore
 import GRDB
 
-enum Selection: Hashable { case updates, watch(Int64) }
+enum Selection: Hashable { case updates, briefing, ask(Int64?), watch(Int64) }
 
 struct ContentView: View {
     @EnvironmentObject var model: AppModel
@@ -14,6 +14,8 @@ struct ContentView: View {
         NavigationSplitView {
             List(selection: $selection) {
                 Label("更新", systemImage: "bell.badge").badge(model.unread).tag(Selection.updates)
+                Label("AI 简报", systemImage: "sparkles").tag(Selection.briefing)
+                Label("问 Radar", systemImage: "bubble.left.and.text.bubble.right").tag(Selection.ask(nil))
                 Section("关注") {
                     ForEach(watches) { w in
                         Label(w.title, systemImage: icon(w)).tag(Selection.watch(w.id!))
@@ -30,6 +32,8 @@ struct ContentView: View {
         } detail: {
             switch selection {
             case .watch(let id): WatchDetailView(watchID: id, selection: $selection).id(id)
+            case .briefing: BriefingView()
+            case .ask(let scope): AskRadarView(scope: scope).id(scope)
             default: UpdatesView()
             }
         }

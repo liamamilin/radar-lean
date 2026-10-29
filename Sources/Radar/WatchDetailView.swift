@@ -55,6 +55,10 @@ struct WatchDetailView: View {
                     if let nlMessage { Text(nlMessage).font(.caption).foregroundStyle(.orange) }
                     Button("保存条件") { save() }
                 }
+                Section("AI 总结") {
+                    SummaryPanel(ai: model.ai, watchID: watchID)
+                    Button("就这个关注事项问 Radar…") { selection = .ask(watchID) }
+                }
                 Section("信息源") {
                     ForEach(sources) { s in sourceRow(s) }
                     HStack {
