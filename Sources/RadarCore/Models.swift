@@ -319,3 +319,24 @@ public func mergeKey(_ s: String) -> String {
     var path = c.path; if path.count > 1 && path.hasSuffix("/") { path.removeLast() }
     return "u:" + host + path + (c.query.map { "?" + $0 } ?? "")
 }
+
+extension Store {
+    /// All information sources as pretty-printed JSON: what each is, where it points, how often it is read and which watches use it.
+    public func exportSources(now: Date = Date()) throws -> Data {
+        struct Item: Codable {
+            var name: String, kind: String, endpoint: String, selector: String?
+            var intervalMinutes: Int, lastSuccessAt: Date?, lastError: String?, watches: [String]
+        }
+        struct Doc: Codable { var exportedAt: Date, count: Int, sources: [Item] }
+        let items: [Item] = try db.read { db in
+            try Source.order(Column("kind"), Column("name")).fetchAll(db).map { s in
+                let titles = try String.fetchAll(db, sql: "SELECT watch.title FROM watch JOIN watchSource ws ON ws.watchID = watch.id WHERE ws.sourceID = ? ORDER BY watch.title", arguments: [s.id])
+                return Item(name: s.name, kind: s.kind.rawValue, endpoint: s.endpoint, selector: s.selector,
+                            intervalMinutes: Int(s.intervalSeconds / 60), lastSuccessAt: s.lastSuccessAt, lastError: s.lastError, watches: titles)
+            }
+        }
+        let enc = JSONEncoder()
+        enc.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]; enc.dateEncodingStrategy = .iso8601
+        return try enc.encode(Doc(exportedAt: now, count: items.count, sources: items))
+    }
+}

@@ -126,4 +126,14 @@ final class AssistantTests: Base {
         XCTAssertFalse(out.contains("S9]("))                                          // a number the database does not know gets no link
         XCTAssertEqual(RadarAssistant.cited("见 [S2] 和 [S9]", ev).map { $0.id }, ["S2"])
     }
+
+    func testExportSourcesListsEverySourceWithItsWatches() throws {
+        let data = try store.exportSources()
+        let o = try JSONSerialization.jsonObject(with: data) as! [String: Any]
+        let list = o["sources"] as! [[String: Any]]
+        XCTAssertEqual(o["count"] as? Int, list.count)
+        XCTAssertEqual(list.count, try store.db.read { try Source.fetchCount($0) })
+        XCTAssertTrue(list.allSatisfy { ($0["endpoint"] as? String)?.isEmpty == false && $0["kind"] != nil })
+        XCTAssertTrue(list.contains { ($0["watches"] as? [String])?.isEmpty == false })
+    }
 }

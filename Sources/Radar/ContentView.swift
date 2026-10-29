@@ -1,6 +1,7 @@
 import SwiftUI
 import RadarCore
 import GRDB
+import UniformTypeIdentifiers
 
 enum Selection: Hashable { case updates, briefing, ask(Int64?), watch(Int64) }
 
@@ -39,6 +40,9 @@ struct ContentView: View {
         }
         .toolbar {
             ToolbarItem {
+                Button { exportSources() } label: { Label("导出信息源", systemImage: "square.and.arrow.up") }.help("把所有信息源导出为 JSON 文件")
+            }
+            ToolbarItem {
                 Button { Task { await model.checkDue(force: true) } } label: {
                     if model.checking > 0 { ProgressView().controlSize(.small) } else { Label("立即检查全部", systemImage: "arrow.clockwise") }
                 }.help("立即检查全部来源")
@@ -64,6 +68,14 @@ struct ContentView: View {
         .task(id: model.revision) {
             watches = (try? await model.store.db.read { try Watch.order(Column("createdAt").desc).fetchAll($0) }) ?? []
         }
+    }
+
+    func exportSources() {
+        guard let data = try? model.store.exportSources() else { return }
+        let panel = NSSavePanel()
+        panel.nameFieldStringValue = "Radar-信息源-\(Date().formatted(.iso8601.year().month().day())).json"
+        panel.allowedContentTypes = [.json]
+        if panel.runModal() == .OK, let url = panel.url { try? data.write(to: url) }
     }
 
     static func snapshot(_ path: String) {
