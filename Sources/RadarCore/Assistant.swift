@@ -233,7 +233,7 @@ public final class RadarAssistant {
             let links = ids.map { id in byID[id].flatMap { URL(string: $0) != nil ? "[\(id)](\($0))" : nil } ?? "\(id)" }
             out.replaceSubrange(whole, with: links.joined(separator: "、"))
         }
-        return out
+        return out.replacingOccurrences(of: #"\)\s*\[S(\d+)\]\("#, with: ")、[S$1](", options: .regularExpression)   // [S1][S6] written as separate brackets
     }
 
     public static func cited(_ text: String, _ evidence: [Evidence]) -> [Evidence] {
