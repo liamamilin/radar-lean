@@ -15,6 +15,11 @@
 | AI 编程工具产品动态 | GitHub Changelog（含 Copilot）、Cursor Changelog、Copilot 价格页（网页变化）、Cline / Claude Code / Codex Releases | 关闭 | 每周比较需要手动生成（同上）；Windsurf 更新日志无法识别、Cursor 价格页读到的内容不对，均未接入；GitHub Changelog 没有按 Copilot 过滤，含其他产品的条目 |
 | 开发者社区：AI Agent / 本地 LLM / 开发效率新工具 | Hacker News 官方搜索接口（Algolia，AI Agent、本地 LLM、Ollama、编程 Agent，设了分数门槛）、Reddit r/LocalLLaMA 本周热门 | 关闭 | 靠关键词过滤，不理解语义。最初用的第三方订阅 hnrss.org 会间歇返回 502，已换成官方接口（新增“Hacker News 搜索”来源类型） |
 
+### 2026-10-30：来源完整性（已做）
+
+新增：官方来源目录（OpenAI、Anthropic、Ollama、Cursor、GitHub Copilot、Windsurf、Hugging Face）、关注页的“官方来源覆盖”报告、通用 JSON 来源、JS 渲染网页（选择器写 `js:`）。详见 [OFFICIAL-SOURCES.md](OFFICIAL-SOURCES.md)。
+仍未做：从已采集内容的外链里发现“被频繁引用但没接入的域名”、漏报反馈（给一个链接，分析为什么没抓到）、来源长期无新内容的告警、站点地图对比、每日摘要、事件分类（弃用 / 下线、安全、政策）。
+
 ### 2026-10-30 复盘：漏掉“Pro 套餐额度翻倍”公告
 
 原因和处理：

@@ -3,7 +3,7 @@ import GRDB
 import CryptoKit
 
 public enum SourceKind: String, Codable, CaseIterable {
-    case githubReleases, githubSearch, rss, web, list, hackerNews
+    case githubReleases, githubSearch, rss, web, list, hackerNews, json
     public var label: String {
         switch self {
         case .githubReleases: return "GitHub Releases"
@@ -12,6 +12,7 @@ public enum SourceKind: String, Codable, CaseIterable {
         case .web: return "静态网页"
         case .list: return "文章/项目列表页"
         case .hackerNews: return "Hacker News 搜索"
+        case .json: return "JSON 接口"
         }
     }
     public var defaultInterval: Double {
@@ -19,6 +20,7 @@ public enum SourceKind: String, Codable, CaseIterable {
         case .githubReleases: return 2 * 3600
         case .rss: return 4 * 3600
         case .hackerNews: return 2 * 3600
+        case .json: return 4 * 3600
         case .githubSearch: return 12 * 3600
         case .web, .list: return 6 * 3600
         }
@@ -296,6 +298,7 @@ public struct SourceSpec: Hashable, Codable {
         case .githubReleases: return "github-releases:" + endpoint.lowercased()
         case .githubSearch: return "github-search:" + endpoint.lowercased().split(separator: " ").joined(separator: " ")
         case .rss: return "rss:" + normalizeURL(endpoint)
+        case .json: return "json:" + normalizeURL(endpoint) + "#" + (selector ?? "")
         case .hackerNews: return "hn:" + endpoint.lowercased().split(separator: " ").joined(separator: " ")
         case .list: return "list:" + normalizeURL(endpoint)
         case .web: return "web:" + normalizeURL(endpoint) + "#" + (selector ?? "default")

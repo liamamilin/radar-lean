@@ -109,9 +109,16 @@ public final class Fetcher {
         case .githubReleases: return try await fetchReleases(src.endpoint, cond: cond)
         case .githubSearch: return try await fetchSearch(src.endpoint, cond: cond)
         case .rss: return try await fetchFeed(src.endpoint, cond: cond)
+        case .web where src.selector?.hasPrefix("js:") == true, .list where src.selector?.hasPrefix("js:") == true:
+            // selector "js:<css>": let a browser engine run the page's JavaScript first
+            guard let url = URL(string: src.endpoint) else { throw RadarError.parse("无效地址") }
+            let html = try await PageRenderer.render(url)
+            let css = String(src.selector!.dropFirst(3))
+            return src.kind == .web ? try extractPage(html: html, url: url, selector: css.isEmpty ? nil : css) : try extractList(html: html, url: url)
         case .web: return try await fetchPage(src.endpoint, selector: src.selector, cond: cond)
         case .list: return try await fetchList(src.endpoint, cond: cond)
         case .hackerNews: return try await fetchHackerNews(src.endpoint)
+        case .json: return try await fetchJSON(src.endpoint, mapping: src.selector ?? "")
         }
     }
 
@@ -255,6 +262,59 @@ public final class Fetcher {
             return e
         }
         return FetchResult(entries: entries, title: "Hacker News · \(query)")
+    }
+
+    /// Any JSON API that returns a list. `mapping` says where the list is and which fields are what, e.g.
+    /// `items=vulnerabilities;id=cveID;title={cveID} · {vendorProject} {product};url=https://nvd.nist.gov/vuln/detail/{cveID};summary=shortDescription;date=dateAdded`
+    /// (`items` empty = the top level is the list; `{field}` fills a template; dotted names reach into nested objects).
+    func fetchJSON(_ urlString: String, mapping: String) async throws -> FetchResult {
+        guard let url = URL(string: urlString) else { throw RadarError.parse("无效地址") }
+        var m: [String: String] = [:]
+        for part in mapping.split(separator: ";") { if let i = part.firstIndex(of: "=") { m[String(part[..<i]).trimmingCharacters(in: .whitespaces)] = String(part[part.index(after: i)...]).trimmingCharacters(in: .whitespaces) } }
+        guard m["id"] != nil || m["url"] != nil, m["title"] != nil else { throw RadarError.parse("JSON 来源需要至少指定 id（或 url）和 title 字段") }
+        let r = try await get(url, maxBytes: 12_000_000)
+        try check(r, allow304: false)
+        guard let root = try? JSONSerialization.jsonObject(with: r.data) else { throw RadarError.parse("不是有效的 JSON") }
+        func dig(_ v: Any?, _ path: String) -> Any? {
+            var cur = v
+            for key in path.split(separator: ".") where !key.isEmpty {
+                if let d = cur as? [String: Any] { cur = d[String(key)] } else if let a = cur as? [Any], let i = Int(key), a.indices.contains(i) { cur = a[i] } else { return nil }
+            }
+            return cur
+        }
+        guard let list = dig(root, m["items"] ?? "") as? [[String: Any]] else { throw RadarError.parse("JSON 里没有找到条目列表（items=\(m["items"] ?? "")）") }
+        func str(_ v: Any?) -> String? {
+            switch v { case let s as String: return s; case let n as NSNumber: return n.stringValue; default: return nil }
+        }
+        func fill(_ spec: String?, _ item: [String: Any]) -> String? {
+            guard let spec, !spec.isEmpty else { return nil }
+            if !spec.contains("{") { return str(dig(item, spec)) }
+            var out = "", rest = Substring(spec)
+            while let open = rest.firstIndex(of: "{"), let close = rest[open...].firstIndex(of: "}") {
+                out += rest[..<open] + (str(dig(item, String(rest[rest.index(after: open)..<close]))) ?? "")
+                rest = rest[rest.index(after: close)...]
+            }
+            return (out + rest).trimmingCharacters(in: .whitespaces)
+        }
+        func date(_ v: Any?) -> Date? {
+            if let n = v as? NSNumber { let t = n.doubleValue; return Date(timeIntervalSince1970: t > 1e11 ? t / 1000 : t) }
+            guard let s = v as? String else { return nil }
+            if let d = Fetcher.iso.date(from: s) { return d }
+            let f = ISO8601DateFormatter(); f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+            if let d = f.date(from: s) { return d }
+            let day = DateFormatter(); day.locale = Locale(identifier: "en_US_POSIX"); day.dateFormat = "yyyy-MM-dd"; day.timeZone = TimeZone(identifier: "UTC")
+            return day.date(from: s)
+        }
+        let entries: [FetchedEntry] = list.compactMap { item in
+            let link = fill(m["url"], item).flatMap { $0.isEmpty ? nil : $0 }
+            guard let title = fill(m["title"], item), !title.isEmpty, let key = fill(m["id"], item).flatMap({ $0.isEmpty ? nil : $0 }) ?? link else { return nil }
+            var e = FetchedEntry(externalKey: "json:" + key, url: link ?? urlString, title: title, summary: String((fill(m["summary"], item) ?? "").prefix(500)))
+            e.publishedAt = date(dig(item, m["date"] ?? ""))
+            for (k, v) in item { if let s = str(v), s.count < 80, !(v is [Any]) { e.meta[k] = s } }
+            return e
+        }
+        guard !entries.isEmpty || list.isEmpty else { throw RadarError.parse("JSON 条目缺少 title / id 字段，请检查字段映射") }
+        return FetchResult(entries: entries, title: url.host)
     }
 
     // MARK: HTML

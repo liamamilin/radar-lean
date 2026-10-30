@@ -54,7 +54,10 @@ struct NewWatchView: View {
                                 Toggle("", isOn: Binding(get: { selected.contains(c.id) }, set: { on in if on { selected.insert(c.id) } else { selected.remove(c.id) } }))
                                     .labelsHidden().disabled(!c.ok)
                                 VStack(alignment: .leading, spacing: 2) {
-                                    Text(c.spec.name).font(.headline)
+                                    HStack(spacing: 6) {
+                                        Text(c.spec.name).font(.headline)
+                                        if c.official { Text("官方").font(.caption2.bold()).padding(.horizontal, 5).background(Color.green.opacity(0.2), in: Capsule()).foregroundStyle(.green) }
+                                    }
                                     Text("\(c.spec.kind.label) · \(c.spec.endpoint)").font(.caption).foregroundStyle(.secondary)
                                     if c.ok, c.latest != nil || c.matched != nil {
                                         Text([c.latest.map { "最近更新 " + $0.formatted(.relative(presentation: .named)) },
@@ -107,7 +110,7 @@ struct NewWatchView: View {
         if p.type == .topic {
             // GitHub sources are always relevant by construction; web-found sources must actually mention the keywords
             let gh = candidates.filter { $0.ok && $0.matched == nil }, web = candidates.filter { $0.ok && ($0.matched ?? 0) > 0 }.prefix(4)
-            selected = Set((gh + web).map { $0.id })
+            selected = Set((gh + web + candidates.filter { $0.ok && $0.official }).map { $0.id })
         } else { selected = Set(candidates.filter { $0.ok }.prefix(1).map { $0.id }) }
         let noSearch = p.type == .topic && !model.searchEnabled
         if p.type == .topic && candidates.isEmpty { message = "内置目录没有匹配这个主题的来源。请提供 GitHub 仓库、RSS 或网页 URL。" }

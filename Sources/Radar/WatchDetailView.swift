@@ -68,6 +68,28 @@ struct WatchDetailView: View {
                     }
                     if let addMessage { Text(addMessage).font(.caption).foregroundStyle(.orange) }
                 }
+                if !officialEntities.isEmpty {
+                    Section("官方来源覆盖") {
+                        ForEach(officialEntities, id: \.name) { ent in
+                            VStack(alignment: .leading, spacing: 6) {
+                                Text(ent.name).font(.headline)
+                                ForEach(ent.channels, id: \.spec.uniqueKey) { ch in
+                                    let attached = sources.contains { $0.uniqueKey == ch.spec.uniqueKey }
+                                    HStack {
+                                        Image(systemName: attached ? "checkmark.circle.fill" : "circle").foregroundStyle(attached ? .green : .secondary)
+                                        Text(ch.spec.name); Text(ch.role).font(.caption).foregroundStyle(.secondary)
+                                        Spacer()
+                                        if !attached { Button("添加") { attachOfficial(ch.spec) } }
+                                    }
+                                }
+                                ForEach(ent.unreadable, id: \.url) { u in
+                                    Label("\(u.name)：\(u.reason)", systemImage: "exclamationmark.triangle").font(.caption).foregroundStyle(.orange)
+                                }
+                            }.padding(.vertical, 2)
+                        }
+                        Text("这是 Radar 已确认能读到的官方渠道。标成橙色的是已知读不了的渠道，Radar 在这些地方是盲区。").font(.caption).foregroundStyle(.secondary)
+                    }
+                }
                 Section("已发现内容（\(entries.count)）") {
                     if entries.isEmpty { Text("来源尚未成功读取").foregroundStyle(.secondary) }
                     ForEach(entries, id: \.0.id) { e, s in entryRow(e, s) }
@@ -137,6 +159,15 @@ struct WatchDetailView: View {
                 Button(tracking.contains(full) ? "已追踪" : "追踪版本") { trackReleases(full) }.disabled(tracking.contains(full))
             }
         }
+    }
+
+    var officialEntities: [OfficialEntity] {
+        guard let watch else { return [] }
+        return OfficialCatalog.entities(in: watch.title + " " + watch.originalText)
+    }
+    func attachOfficial(_ spec: SourceSpec) {
+        guard let src = try? model.store.attach(watchID: watchID, spec: spec) else { return }
+        Task { await model.check(sourceID: src.id!) }
     }
 
     func load() async {

@@ -194,3 +194,63 @@ final class PricingNewsTests: Base {
         XCTAssertTrue(Engine.shouldNotify(plan: p, kind: evs[0].kind))
     }
 }
+
+final class JSONSourceTests: Base {
+    let mapping = "items=vulnerabilities;id=cveID;title={cveID} · {vendorProject} {product};url=https://nvd.nist.gov/vuln/detail/{cveID};summary=shortDescription;date=dateAdded"
+    func body(_ ids: [String]) -> Data {
+        let v = ids.map { #"{"cveID":"\#($0)","vendorProject":"Acme","product":"Router","shortDescription":"RCE in Router","dateAdded":"2026-10-29"}"# }
+        return Data(#"{"title":"kev","vulnerabilities":[\#(v.joined(separator: ","))]}"#.utf8)
+    }
+
+    func testJSONSourceMapsFieldsAndReportsOnlyNewItems() async throws {
+        Stub.routes["https://example.gov/kev.json"] = .init(body: body(["CVE-2026-0001"]))
+        let (w, _) = try watch(WatchPlan(type: .feed, title: "kev"), SourceSpec(kind: .json, endpoint: "https://example.gov/kev.json", name: "KEV", selector: mapping))
+        let base = await engine.check(watchID: w.id!)
+        XCTAssertEqual(base.count, 0)                                                        // baseline
+        let e = try store.sync { try Entry.fetchAll($0) }
+        XCTAssertEqual(e.first?.title, "CVE-2026-0001 · Acme Router")
+        XCTAssertEqual(e.first?.canonicalURL, "https://nvd.nist.gov/vuln/detail/CVE-2026-0001")
+        Stub.routes["https://example.gov/kev.json"] = .init(body: body(["CVE-2026-0002", "CVE-2026-0001"]))
+        let next = await engine.check(watchID: w.id!)
+        XCTAssertEqual(next.map { $0.title }, ["CVE-2026-0002 · Acme Router"])
+    }
+
+    func testJSONSourceWithWrongMappingFailsClearly() async throws {
+        Stub.routes["https://example.gov/kev.json"] = .init(body: body(["CVE-1"]))
+        let (w, s) = try watch(WatchPlan(type: .feed, title: "kev"), SourceSpec(kind: .json, endpoint: "https://example.gov/kev.json", name: "KEV", selector: "items=nothing;id=cveID;title=cveID"))
+        _ = await engine.check(watchID: w.id!)
+        let src = try store.sync { try Source.fetchOne($0, key: s.id!) }
+        XCTAssertTrue(src?.lastError?.contains("条目列表") == true)
+        XCTAssertFalse(src!.initialized)
+    }
+}
+
+final class OfficialCatalogTests: Base {
+    func testEntitiesAreMatchedByNameInASentence() {
+        let names = OfficialCatalog.entities(in: "关注 Ollama、Claude Code 和 Codex 的重要更新").map { $0.name }
+        XCTAssertTrue(names.contains("Ollama")); XCTAssertTrue(names.contains("OpenAI / ChatGPT / Codex")); XCTAssertTrue(names.contains("Anthropic / Claude"))
+        XCTAssertTrue(OfficialCatalog.entities(in: "关注 R 语言的最新动态").isEmpty)
+    }
+
+    func testCatalogChannelsAreUniqueAndKnownGapsAreRecorded() {
+        let keys = OfficialCatalog.entities.flatMap { $0.channels }.map { $0.spec.uniqueKey }
+        XCTAssertEqual(keys.count, Set(keys).count)
+        let openai = OfficialCatalog.entities.first { $0.aliases.contains("openai") }!
+        XCTAssertTrue(openai.unreadable.contains { $0.url.contains("help.openai.com") })   // the help-center release notes are a known blind spot
+    }
+
+    func testDiscoveryOffersOfficialChannelsForANamedProduct() async throws {
+        Stub.dynamic = { url in
+            if url.absoluteString.contains("ollama.com/blog/rss.xml") { return .init(body: Data(#"<?xml version="1.0"?><rss version="2.0"><channel><title>Ollama</title><item><title>New model</title><link>https://ollama.com/blog/x</link><guid>x</guid></item></channel></rss>"#.utf8)) }
+            if url.absoluteString.contains("api.github.com/repos/ollama/ollama/releases") { return .init(body: Data("[]".utf8)) }
+            return nil
+        }
+        let disc = Discovery(fetcher: Fetcher(session: engineSession()), store: store)
+        var plan = WatchPlan(type: .topic, title: "ollama"); plan.include = ["ollama"]
+        let cands = await disc.findSources(plan: plan, text: "关注 Ollama 的更新")
+        let official = cands.filter { $0.official }
+        XCTAssertTrue(official.contains { $0.spec.endpoint.contains("ollama.com/blog/rss.xml") && $0.ok })
+    }
+
+    func engineSession() -> URLSession { let c = URLSessionConfiguration.ephemeral; c.protocolClasses = [Stub.self]; return URLSession(configuration: c) }
+}

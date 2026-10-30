@@ -77,3 +77,22 @@ final class LocalServerTests: XCTestCase {
         XCTAssertTrue(evs.contains { $0.kind == "pageChange" && ($0.beforeSnippet ?? "").contains("2") && ($0.afterSnippet ?? "").contains("3") })
     }
 }
+
+/// A page whose content only exists after its JavaScript runs.
+extension LocalServerTests {
+    func testJavaScriptRenderedPageIsReadWithJsPrefixButNotWithoutIt() async throws {
+        let html = #"<html><head><title>Pricing</title></head><body><div id="app"></div><script>setTimeout(function(){document.getElementById('app').innerHTML='<article>Pro plan costs 20 dollars per month and includes the agent features for every user.</article>'},300)</script></body></html>"#
+        try put("js.html", html)
+        let f = Fetcher()
+        let url = "http://127.0.0.1:\(port)/js.html"
+        do { _ = try await f.fetch(SourceSpec(kind: .web, endpoint: url, name: "static")); XCTFail("static read should find no text") } catch {}
+        let r = try await f.fetch(SourceSpec(kind: .web, endpoint: url, name: "js", selector: "js:"))
+        XCTAssertTrue(r.entries.first?.text.contains("Pro plan costs 20 dollars") == true)
+    }
+
+    func testVerificationPageIsReportedNotBypassed() async throws {
+        try put("wall.html", "<html><head><title>Just a moment...</title></head><body><p>Checking your browser before accessing</p></body></html>")
+        do { _ = try await Fetcher().fetch(SourceSpec(kind: .web, endpoint: "http://127.0.0.1:\(port)/wall.html", name: "w", selector: "js:")); XCTFail("expected an error") }
+        catch { XCTAssertTrue(error.localizedDescription.contains("人机验证"), error.localizedDescription) }
+    }
+}

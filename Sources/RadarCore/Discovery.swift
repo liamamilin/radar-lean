@@ -11,6 +11,7 @@ public struct Candidate: Identifiable {
     public var latest: Date? = nil
     public var matched: Int? = nil   // recent entries mentioning the plan keywords
     public var total = 0
+    public var official = false   // a channel from OfficialCatalog
 }
 
 public struct Topic {
@@ -140,11 +141,12 @@ public final class Discovery {
         let current = (try? await store.db.read { try Source.fetchAll($0, sql: "SELECT source.* FROM source JOIN watchSource ws ON ws.sourceID = source.id WHERE ws.watchID = ?", arguments: [watchID]) }) ?? []
         let have = Set(current.map { $0.uniqueKey })
         let cands = await findSources(plan: plan, text: text + " " + plan.include.joined(separator: " "))
-        let fresh = Array(cands.filter { $0.ok && !have.contains($0.spec.uniqueKey) && ($0.matched ?? 1) > 0 }.prefix(3))
+        let usable = cands.filter { $0.ok && !have.contains($0.spec.uniqueKey) && ($0.matched ?? 1) > 0 }
+        let fresh = usable.filter { $0.official } + Array(usable.filter { !$0.official }.prefix(3))   // official channels are all kept
         for c in fresh { _ = try? store.attach(watchID: watchID, spec: c.spec) }
         var stale: [String] = []
         for s in current where s.kind == .rss || s.kind == .list {
-            let c = await probe(SourceSpec(kind: s.kind, endpoint: s.endpoint, name: s.name), include: plan.include)
+            let c = await probe(SourceSpec(kind: s.kind, endpoint: s.endpoint, name: s.name, selector: s.selector), include: plan.include)
             if c.ok, c.total > 0, c.matched == 0 { stale.append(s.name) }
         }
         return (fresh, stale, cands.filter { !$0.ok && !have.contains($0.spec.uniqueKey) }.compactMap { $0.error }.prefix(2).map { $0 })
@@ -162,6 +164,13 @@ public final class Discovery {
         }
         async let webSpecs: [SourceSpec] = plan.type == .topic ? searchSpecs(plan: plan, text: text) : []   // overlaps with the GitHub probes
         var out = await probeAll(await specs(for: plan, text: text), include: [])
+        if plan.type == .topic || plan.type == .feed {          // official channels of every product / company the watch names
+            let known = Set(out.map { $0.spec.uniqueKey })
+            let official = OfficialCatalog.entities(in: text).flatMap { $0.channels }.filter { $0.auto }.map { $0.spec }.filter { !known.contains($0.uniqueKey) }
+            var cands = await probeAll(official, include: [])
+            for i in cands.indices { cands[i].official = true }
+            out = cands + out
+        }
         guard plan.type == .topic else { return out }
         // Web-searched sites: probe, drop dead/stale feeds, rank by keyword hits then freshness.
         let searched = await webSpecs.filter { s in !out.contains(where: { $0.spec.uniqueKey == s.uniqueKey }) }
