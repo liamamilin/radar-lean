@@ -170,3 +170,27 @@ final class HackerNewsTests: Base {
         XCTAssertFalse(src!.initialized)
     }
 }
+
+final class PricingNewsTests: Base {
+    func testPricingAndAllowanceNewsIsImportant() async throws {
+        for t in ["Codex and Work usage doubles for Pro 100 subscribers", "ChatGPT Pro 200 allowance change", "Claude 套餐额度翻倍", "Cursor pricing update: new plans"] {
+            XCTAssertTrue(Engine.isPricingNews(t), t)
+        }
+        for t in ["How Oracle turns days of work into minutes", "Show HN: A local agent runner", "Weekly digest: Node.js 26 ships"] {
+            XCTAssertFalse(Engine.isPricingNews(t), t)
+        }
+    }
+
+    func testPricingPostBecomesMajorUpdateAndNotifiesTopicWatch() async throws {
+        let feed = { (items: String) in Data(#"<?xml version="1.0"?><rss version="2.0"><channel><title>t</title>\#(items)</channel></rss>"#.utf8) }
+        let item = { (t: String, id: String) in "<item><title>\(t)</title><link>https://example.com/\(id)</link><guid>\(id)</guid><description>d</description></item>" }
+        Stub.routes["https://example.com/feed.xml"] = .init(body: feed(item("old post", "1")))
+        var p = WatchPlan(type: .topic, title: "t"); p.include = ["chatgpt"]
+        let (w, _) = try watch(p, SourceSpec(kind: .rss, endpoint: "https://example.com/feed.xml", name: "f"))
+        _ = await engine.check(watchID: w.id!)
+        Stub.routes["https://example.com/feed.xml"] = .init(body: feed(item("ChatGPT Pro 100 usage doubled", "2") + item("old post", "1")))
+        let evs = await engine.check(watchID: w.id!)
+        XCTAssertEqual(evs.map { $0.kind }, ["majorUpdate"])
+        XCTAssertTrue(Engine.shouldNotify(plan: p, kind: evs[0].kind))
+    }
+}

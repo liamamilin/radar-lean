@@ -15,6 +15,14 @@
 | AI 编程工具产品动态 | GitHub Changelog（含 Copilot）、Cursor Changelog、Copilot 价格页（网页变化）、Cline / Claude Code / Codex Releases | 关闭 | 每周比较需要手动生成（同上）；Windsurf 更新日志无法识别、Cursor 价格页读到的内容不对，均未接入；GitHub Changelog 没有按 Copilot 过滤，含其他产品的条目 |
 | 开发者社区：AI Agent / 本地 LLM / 开发效率新工具 | Hacker News 官方搜索接口（Algolia，AI Agent、本地 LLM、Ollama、编程 Agent，设了分数门槛）、Reddit r/LocalLLaMA 本周热门 | 关闭 | 靠关键词过滤，不理解语义。最初用的第三方订阅 hnrss.org 会间歇返回 502，已换成官方接口（新增“Hacker News 搜索”来源类型） |
 
+### 2026-10-30 复盘：漏掉“Pro 套餐额度翻倍”公告
+
+原因和处理：
+1. **没有官方来源**：原先只有第三方聚合站（还会晚一天以上）。已把 OpenAI 官方新闻 RSS、Anthropic 官方新闻页、Codex 定价页（网页变化，能给出前后片段）接入“chatgpt / claude / codex 动态”。
+2. **价格 / 额度类消息不被当作重要**：标题含 pricing、price、usage limit、allowance、quota、credits、subscription、额度、价格、套餐、订阅、翻倍、Pro 100 等，现在直接判为“重大更新”，主题类关注会弹通知。
+3. **仍然读不到的渠道**：`help.openai.com` 的 ChatGPT 发布说明页对自动化请求返回 403（网站拦截程序访问），ChatGPT 官方定价页同样 403，社交账号无法读取。Radar 不伪装浏览器绕过拦截，所以这几处暂时没有覆盖；如果重要公告只发在这些渠道，Radar 仍然会漏。
+4. 试过的 Codex 更新日志页被识别成导航菜单，没有价值，已撤掉（Codex 版本已由 GitHub Releases 覆盖）。
+
 附带修复：GitHub Releases 单次响应上限由 5MB 放宽到 25MB，否则 `openai/codex` 的发布列表（发布说明很长）会报“内容过大”。
 
 ## 一、已确定要做的五个雷达

@@ -196,6 +196,14 @@ public final class Engine {
     static let majorWords = ["release", "released", "launch", "introducing", "announcing", "announce", "open source", "open-source", "v1", "1.0", "2.0",
                              "发布", "上线", "重磅", "全新", "正式版", "major"]
 
+    /// Plan, price and usage-allowance news changes what a user can do with a product, so it counts as important even without launch words in the title.
+    static let pricingWords = ["pricing", "price", "usage limit", "message limit", "allowance", "quota", "credits", "subscription", "billing", "free tier",
+                               "额度", "价格", "降价", "涨价", "套餐", "资费", "订阅", "翻倍", "限额", "免费版"]
+    static func isPricingNews(_ title: String) -> Bool {
+        let t = title.lowercased()
+        return pricingWords.contains { t.contains($0) } || t.range(of: #"\bpro\s?\d{2,3}\b"#, options: .regularExpression) != nil   // "Pro 100", "Pro 200"
+    }
+
     /// Is a freshly discovered GitHub repo worth an alert? Young repos need fewer stars; the threshold is the plan's (default 50).
     static func worthAlert(stars: Int, ageDays: Double, minStars: Int?) -> Bool {
         let need = minStars ?? 50
@@ -248,6 +256,7 @@ public final class Engine {
         case .rss, .list, .hackerNews:
             guard relevant(hay) else { return nil }
             let t = entry.title.lowercased()
+            if isPricingNews(entry.title) { return Judged(reason: "价格 / 额度 / 套餐相关", kind: "majorUpdate") }
             let major = majorWords.contains { t.contains($0) }
             return Judged(reason: kind == .list ? "列表页新条目" : "新文章", kind: major ? "majorUpdate" : "update")
         case .web:
