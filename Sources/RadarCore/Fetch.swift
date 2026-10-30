@@ -111,6 +111,7 @@ public final class Fetcher {
         case .rss: return try await fetchFeed(src.endpoint, cond: cond)
         case .web: return try await fetchPage(src.endpoint, selector: src.selector, cond: cond)
         case .list: return try await fetchList(src.endpoint, cond: cond)
+        case .hackerNews: return try await fetchHackerNews(src.endpoint)
         }
     }
 
@@ -230,6 +231,30 @@ public final class Fetcher {
             for i in f.items ?? [] { add(id: i.id, link: i.url, title: i.title, summary: i.summary ?? i.contentText, date: i.datePublished) }
         }
         return FetchResult(entries: entries, title: title)
+    }
+
+    /// Hacker News stories matching a query, newest first. endpoint = "<query>|<minimum points>" (official Algolia search API, no key).
+    func fetchHackerNews(_ endpoint: String) async throws -> FetchResult {
+        let parts = endpoint.split(separator: "|", maxSplits: 1).map { String($0).trimmingCharacters(in: .whitespaces) }
+        guard let query = parts.first, !query.isEmpty else { throw RadarError.parse("无效的 Hacker News 查询") }
+        let points = parts.count > 1 ? Int(parts[1]) ?? 0 : 0
+        var c = URLComponents(string: "https://hn.algolia.com/api/v1/search_by_date")!
+        c.queryItems = [URLQueryItem(name: "query", value: query), URLQueryItem(name: "tags", value: "story"),
+                        URLQueryItem(name: "numericFilters", value: "points>=\(points)"), URLQueryItem(name: "hitsPerPage", value: "50")]
+        let r = try await get(c.url!)
+        try check(r, allow304: false)
+        guard let o = try JSONSerialization.jsonObject(with: r.data) as? [String: Any], let hits = o["hits"] as? [[String: Any]] else { throw RadarError.parse("Hacker News 响应格式不符") }
+        let entries: [FetchedEntry] = hits.compactMap { h in
+            guard let id = h["objectID"] as? String, let title = h["title"] as? String, !title.isEmpty else { return nil }
+            let discussion = "https://news.ycombinator.com/item?id=\(id)"
+            let url = (h["url"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? discussion
+            let pts = h["points"] as? Int ?? 0, comments = h["num_comments"] as? Int ?? 0
+            var e = FetchedEntry(externalKey: "hn:" + id, url: url, title: title, summary: "\(pts) 分 · \(comments) 条评论 · 讨论：\(discussion)")
+            e.publishedAt = (h["created_at"] as? String).flatMap { Fetcher.iso.date(from: $0) }
+            e.meta = ["points": String(pts), "comments": String(comments)]
+            return e
+        }
+        return FetchResult(entries: entries, title: "Hacker News · \(query)")
     }
 
     // MARK: HTML

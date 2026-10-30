@@ -164,7 +164,7 @@ public final class Engine {
         if kind == .githubReleases { return "gh:" + endpoint.lowercased() }
         let k = mergeKey(e.canonicalURL)
         if k.hasPrefix("gh:") { return k }
-        guard kind == .rss || kind == .list else { return "" }
+        guard kind == .rss || kind == .list || kind == .hackerNews else { return "" }
         let hay = String((e.summary + " " + e.text).prefix(3000))   // not the URL itself: a release page must not collapse into its repo
         guard let r = hay.range(of: #"github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)"#, options: .regularExpression) else { return "" }
         let parts = hay[r].dropFirst("github.com/".count).split(separator: "/")
@@ -183,7 +183,7 @@ public final class Engine {
         case .githubSearch: return "discover"
         case .githubReleases: return "release:" + (ver(entry.meta["tag"] ?? entry.title) ?? entry.title.lowercased())
         case .web: return "page"
-        case .rss, .list:
+        case .rss, .list, .hackerNews:
             if j.kind == "majorUpdate", let v = ver(entry.title) { return "release:" + v }   // "Announcing v1.0" covers the v1.0 release
             return j.kind == "update" ? "discover" : "article:" + mk                         // an ordinary post about a project is coverage of its discovery
         }
@@ -245,7 +245,7 @@ public final class Engine {
             let lang = entry.meta["language"].flatMap { $0.isEmpty ? nil : " · " + $0 } ?? ""
             if let was = rising { return Judged(reason: "项目升温 · ★\(was) → ★\(stars) · 创建 \(Int(age)) 天\(lang)", kind: "newProject") }
             return Judged(reason: "新项目 · 创建 \(Int(age)) 天 · ★\(stars)\(lang)", kind: "newProject")
-        case .rss, .list:
+        case .rss, .list, .hackerNews:
             guard relevant(hay) else { return nil }
             let t = entry.title.lowercased()
             let major = majorWords.contains { t.contains($0) }

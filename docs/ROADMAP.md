@@ -13,7 +13,7 @@
 | AI 论文雷达 | arXiv 查询（Agent / LLM 推理 / 本地 LLM / 推测解码 / KV cache / 量化，按提交时间倒序，100 条） | 关闭（论文太多） | “每周最值得阅读的五篇”没有自动化，需要你每周在“AI 简报”里选该关注、范围 7 天，手动生成总结 |
 | Ollama / Claude Code / Codex 重要更新 | 三个仓库的 GitHub Releases，仅稳定版 | 仅主要 / 次要版本升级 | 无法区分“新功能”和“修复”，也识别不了“重大行为变化”；补丁版本只进列表不通知。Claude Code 发版很勤，列表会很长 |
 | AI 编程工具产品动态 | GitHub Changelog（含 Copilot）、Cursor Changelog、Copilot 价格页（网页变化）、Cline / Claude Code / Codex Releases | 关闭 | 每周比较需要手动生成（同上）；Windsurf 更新日志无法识别、Cursor 价格页读到的内容不对，均未接入；GitHub Changelog 没有按 Copilot 过滤，含其他产品的条目 |
-| 开发者社区：AI Agent / 本地 LLM / 开发效率新工具 | Hacker News 搜索订阅（AI Agent、本地 LLM、Ollama、编程 Agent，设了分数门槛）、Reddit r/LocalLLaMA 本周热门 | 关闭 | 靠关键词过滤，不理解语义；HN 订阅依赖第三方服务 hnrss.org，试读时出现过临时 502，不稳定时会在来源上显示读取失败 |
+| 开发者社区：AI Agent / 本地 LLM / 开发效率新工具 | Hacker News 官方搜索接口（Algolia，AI Agent、本地 LLM、Ollama、编程 Agent，设了分数门槛）、Reddit r/LocalLLaMA 本周热门 | 关闭 | 靠关键词过滤，不理解语义。最初用的第三方订阅 hnrss.org 会间歇返回 502，已换成官方接口（新增“Hacker News 搜索”来源类型） |
 
 附带修复：GitHub Releases 单次响应上限由 5MB 放宽到 25MB，否则 `openai/codex` 的发布列表（发布说明很长）会报“内容过大”。
 

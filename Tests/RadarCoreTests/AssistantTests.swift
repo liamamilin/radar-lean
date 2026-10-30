@@ -137,3 +137,36 @@ final class AssistantTests: Base {
         XCTAssertTrue(list.contains { ($0["watches"] as? [String])?.isEmpty == false })
     }
 }
+
+final class HackerNewsTests: Base {
+    func hits(_ items: [(String, String, String?, Int)]) -> Data {
+        let list = items.map { #"{"objectID":"\#($0.0)","title":"\#($0.1)","url":\#($0.2.map { "\"\($0)\"" } ?? "null"),"points":\#($0.3),"num_comments":7,"created_at":"2026-10-29T10:00:00Z"}"# }
+        return Data(#"{"hits":[\#(list.joined(separator: ","))]}"#.utf8)
+    }
+
+    func testHackerNewsSourceBaselineThenNewStory() async throws {
+        let url = "https://hn.algolia.com/api/v1/search_by_date"
+        Stub.routes[url] = .init(body: hits([("1", "Show HN: local agent runner", "https://example.com/a", 120), ("2", "Ask HN: which coding agent?", nil, 80)]))
+        var p = WatchPlan(type: .feed, title: "hn"); p.include = ["agent"]
+        let (w, _) = try watch(p, SourceSpec(kind: .hackerNews, endpoint: "ai agent|40", name: "HN"))
+        let first = await engine.check(watchID: w.id!)
+        XCTAssertEqual(first.count, 0)                                            // first read is only a baseline
+        let entries = try store.sync { try Entry.fetchAll($0) }
+        XCTAssertEqual(entries.count, 2)
+        XCTAssertTrue(entries.contains { $0.canonicalURL == "https://news.ycombinator.com/item?id=2" })   // no external URL → the discussion page
+        XCTAssertTrue(entries.contains { $0.canonicalURL == "https://example.com/a" })
+        Stub.routes[url] = .init(body: hits([("3", "A new agent framework for local models", "https://example.com/c", 200), ("1", "Show HN: local agent runner", "https://example.com/a", 130)]))
+        let second = await engine.check(watchID: w.id!)
+        XCTAssertEqual(second.map { $0.title }, ["A new agent framework for local models"])
+        XCTAssertTrue(Stub.hits.keys.contains { $0.contains("numericFilters=points%3E%3D40") || $0.contains("points>=40") })
+    }
+
+    func testHackerNewsServerErrorIsReportedOnTheSource() async throws {
+        Stub.routes["https://hn.algolia.com/api/v1/search_by_date"] = .init(status: 502)
+        let (w, s) = try watch(WatchPlan(type: .feed, title: "hn"), SourceSpec(kind: .hackerNews, endpoint: "ollama|20", name: "HN"))
+        _ = await engine.check(watchID: w.id!)
+        let src = try store.sync { try Source.fetchOne($0, key: s.id!) }
+        XCTAssertNotNil(src?.lastError)
+        XCTAssertFalse(src!.initialized)
+    }
+}
