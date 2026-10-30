@@ -210,7 +210,7 @@ struct AskRadarView: View {
     @State var scope: Int64?
     @State private var watches: [Watch] = []
     @State private var range: TimeRange?
-    struct Turn: Identifiable { let id = UUID(); var question: String; var answer = ""; var evidence: [Evidence] = []; var done = false; var failed: String? }
+    struct Turn: Identifiable { let id = UUID(); var question: String; var answer = ""; var evidence: [Evidence] = []; var done = false; var failed: String?; var searched: [String] = []; var canned = false }
     @State private var turns: [Turn] = []
     @State private var evidence: [Evidence] = []
     @State private var input = ""
@@ -254,7 +254,7 @@ struct AskRadarView: View {
                                 if t.answer.isEmpty && t.failed == nil { HStack { ProgressView().controlSize(.small); Text("正在检索并生成…").font(.caption).foregroundStyle(.secondary) } }
                                 else if !t.answer.isEmpty { MarkdownText(text: RadarAssistant.linkCitations(t.answer, t.evidence)) }
                                 if t.done { SourceList(items: RadarAssistant.cited(t.answer, t.evidence)) }
-                                if t.done || !t.answer.isEmpty { Text("本次检索了 \(t.evidence.count) 条资料").font(.caption2).foregroundStyle(.secondary) }
+                                if t.done || !t.answer.isEmpty { Text("本次检索了 \(t.evidence.count) 条资料" + (t.searched.isEmpty ? "" : "（扩展检索词：\(t.searched.prefix(8).joined(separator: ", "))）")).font(.caption2).foregroundStyle(.secondary) }
                             }.id(t.id)
                         }
                     }.padding(16).frame(maxWidth: .infinity, alignment: .leading)
@@ -277,16 +277,27 @@ struct AskRadarView: View {
         let q = input.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !q.isEmpty, !busy, let m = model.ai.selected else { return }
         input = ""; busy = true
-        let history = turns.filter { $0.done && !$0.answer.isEmpty }.flatMap { [ChatMessage(role: "user", content: $0.question), ChatMessage(role: "assistant", content: $0.answer)] }
+        let history = turns.filter { $0.done && !$0.answer.isEmpty && !$0.canned }.flatMap { [ChatMessage(role: "user", content: $0.question), ChatMessage(role: "assistant", content: $0.answer)] }
         let a = model.ai.assistant, prev = evidence, wid = scope, rg = range, title = scopeTitle
         let turn = Turn(question: q); turns.append(turn)
         func update(_ f: (inout Turn) -> Void) { if let i = turns.firstIndex(where: { $0.id == turn.id }) { f(&turns[i]) } }   // "新对话" may have removed it
         task = Task {
             defer { busy = false; update { $0.done = true } }
             do {
-                let ev = try await Task.detached { try a.askContext(question: q, watchID: wid, range: rg, previous: prev) }.value
-                evidence = ev; update { $0.evidence = ev }
-                for try await piece in model.ai.client.chat(model: m, messages: RadarAssistant.askMessages(history: history, question: q, evidence: ev, scope: title)) { update { $0.answer += piece } }
+                // the stored content is mostly English: have the local model add English search terms for a Chinese question
+                var extra: [String] = []
+                if RadarAssistant.needsExpansion(q) {
+                    var raw = ""
+                    do { for try await piece in model.ai.client.chat(model: m, messages: RadarAssistant.expandMessages(q)) { raw += piece; if raw.count > 400 { break } } } catch is CancellationError { throw CancellationError() } catch {}   // expansion is optional
+                    extra = RadarAssistant.parseTerms(raw)
+                }
+                let r = try await Task.detached { try a.retrieve(question: q, extraTerms: extra, watchID: wid, range: rg, previous: prev) }.value
+                evidence = r.evidence; update { $0.evidence = r.evidence; $0.searched = extra }
+                if !r.matched {
+                    update { $0.canned = true; $0.answer = "没有找到和这个问题相关的已保存资料，所以不作回答（避免编造）。\n\n可以试试：\n- 把时间范围改成“全部”，或换个说法\n- 到对应关注里用“漏报分析”贴一个相关链接，看是缺来源还是被过滤\n- 如果这个话题没有被关注，新建一个关注" }
+                    return
+                }
+                for try await piece in model.ai.client.chat(model: m, messages: RadarAssistant.askMessages(history: history, question: q, evidence: r.evidence, scope: title)) { update { $0.answer += piece } }
             } catch is CancellationError {} catch { update { $0.failed = error.localizedDescription } }
         }
     }

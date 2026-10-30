@@ -105,6 +105,32 @@ final class AssistantTests: Base {
         XCTAssertTrue(none.allSatisfy { $0.date! > Date().addingTimeInterval(-86400) })
     }
 
+    func testExpansionTermsFindEnglishItemsForAChineseQuestion() throws {
+        try entry("pricing-change", "Codex usage limit doubled for Pro plan", stars: 0)
+        try entry("other", "unrelated cooking thing", stars: 0)
+        let a = RadarAssistant(store: store)
+        XCTAssertTrue(RadarAssistant.needsExpansion("额度有什么变化"))
+        XCTAssertFalse(RadarAssistant.needsExpansion("usage limit"))
+        let plain = try a.retrieve(question: "额度有什么变化", extraTerms: [], watchID: nil, range: nil, previous: [])
+        XCTAssertFalse(plain.matched)                                   // nothing matches, and no filler is offered
+        let terms = RadarAssistant.parseTerms("好的，关键词如下：\n1. usage limit, quota, \"pricing\", Codex")
+        XCTAssertEqual(terms, ["usage limit", "quota", "pricing", "codex"])
+        let r = try a.retrieve(question: "额度有什么变化", extraTerms: terms, watchID: nil, range: nil, previous: [])
+        XCTAssertTrue(r.matched)
+        XCTAssertEqual(r.evidence.first?.title, "pricing-change")
+    }
+
+    func testQuestionsAboutRadarItselfGetSourceStatus() throws {
+        try entry("x", "something")
+        try store.db.write { try $0.execute(sql: "UPDATE source SET lastError = 'HTTP 403', initialized = 1") }
+        let a = RadarAssistant(store: store)
+        XCTAssertTrue(RadarAssistant.isAboutRadar("哪些来源读取失败了？"))
+        let r = try a.retrieve(question: "哪些来源读取失败了？", extraTerms: [], watchID: nil, range: nil, previous: [])
+        XCTAssertTrue(r.matched)
+        XCTAssertTrue(r.evidence.contains { $0.kind == "status" && $0.text.contains("HTTP 403") })
+        XCTAssertTrue(r.evidence.first?.text.contains("读取失败 1 个") == true)
+    }
+
     func testAskCanBeScopedToOneWatch() throws {
         try entry("in-scope", "agent runtime")
         let (w2, s2) = try watch(WatchPlan(type: .topic, title: "other"), SourceSpec(kind: .githubSearch, endpoint: "topic:y", name: "GitHub · Y"))

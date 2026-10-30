@@ -143,16 +143,82 @@ public final class RadarAssistant {
         return out.filter { !stop.contains($0) && seen.insert($0).inserted }
     }
 
-    /// Lexical retrieval over what Radar already stored. `previous` keeps earlier numbering so follow-ups can refer to it.
+    public struct Retrieval {
+        public var evidence: [Evidence]
+        public var matched: Bool       // false: the question named something and nothing stored mentions it (the evidence is only what was carried over)
+    }
+
     public func askContext(question: String, watchID: Int64?, range: TimeRange?, previous: [Evidence], now: Date = Date(), maxNew: Int = 10) throws -> [Evidence] {
+        try retrieve(question: question, extraTerms: [], watchID: watchID, range: range, previous: previous, now: now, maxNew: maxNew).evidence
+    }
+
+    // MARK: query expansion (the stored content is mostly English, the questions are often Chinese)
+
+    /// Only worth a model call when the question has CJK text and so cannot match English titles directly.
+    public static func needsExpansion(_ q: String) -> Bool { q.unicodeScalars.contains { (0x4E00...0x9FFF).contains($0.value) } }
+
+    public static func expandMessages(_ q: String) -> [ChatMessage] {
+        [ChatMessage(role: "system", content: "你把用户的问题改写成用于检索英文科技资讯标题的关键词。输出 6 到 12 个英文关键词或短语（含常见同义词和产品名），用英文逗号分隔，只输出关键词，不要解释。例如问题“OpenAI 额度有什么变化”输出：openai, usage limit, quota, pricing, credits, plan, codex, chatgpt"),
+         ChatMessage(role: "user", content: q)]
+    }
+
+    /// Model output -> search terms. Defensive: models add numbering, quotes or a lead-in sentence.
+    public static func parseTerms(_ raw: String) -> [String] {
+        let line = raw.split(separator: "\n").map(String.init).max { a, b in a.filter { ",，".contains($0) }.count < b.filter { ",，".contains($0) }.count } ?? raw   // the list line, not a lead-in sentence
+        var seen = Set<String>()
+        return line.split(whereSeparator: { ",，;；\n".contains($0) }).map {
+            $0.trimmingCharacters(in: CharacterSet(charactersIn: " \t\"'“”`*-•0123456789.、)）(（")).lowercased()
+        }.filter { $0.count >= 2 && $0.count <= 40 && !stop.contains($0) && seen.insert($0).inserted }.prefix(14).map { $0 }
+    }
+
+    // MARK: Radar's own state ("which sources fail?")
+
+    static let statusMarkers = ["读取失败", "读不了", "读不到", "抓不到", "报错", "出错", "失败", "来源", "信息源", "关注了什么", "关注了哪些", "有哪些关注", "覆盖", "为什么没", "没提醒", "没有提醒", "漏", "健康", "状态", "还在工作", "正常吗"]
+    public static func isAboutRadar(_ q: String) -> Bool { statusMarkers.contains { q.contains($0) } }
+
+    func statusEvidence(_ db: Database, watchID: Int64?, now: Date) throws -> [Evidence] {
+        let watches = try Watch.fetchAll(db).filter { watchID == nil || $0.id == watchID }
+        var out: [Evidence] = []
+        func item(_ title: String, _ text: String, url: String = "", date: Date? = nil) {
+            out.append(Evidence(id: "", title: title, url: url, origin: "Radar 状态", date: date, text: text, meta: "", isEvent: false, kind: "status"))
+        }
+        var bad = 0, stale = 0, total = 0
+        var lines: [String] = []
+        for w in watches {
+            let srcs = try Source.fetchAll(db, sql: "SELECT source.* FROM source JOIN watchSource ws ON ws.sourceID = source.id WHERE ws.watchID = ? ORDER BY source.name", arguments: [w.id!])
+            total += srcs.count
+            lines.append("关注“\(w.title)”（\(w.status == "active" ? "进行中" : "已暂停")）：\(srcs.count) 个来源")
+            for s in srcs {
+                let link = URL(string: s.endpoint)?.scheme?.hasPrefix("http") == true ? s.endpoint : ""
+                if let e = s.lastError {
+                    bad += 1
+                    if out.count < 7 { item("来源读取失败：\(s.name)", "属于关注“\(w.title)”。最近一次读取失败：\(e)。上次成功：\(s.lastSuccessAt.map { $0.formatted(date: .abbreviated, time: .shortened) } ?? "从未成功")。", url: link, date: s.lastCheckedAt) }
+                } else if s.initialized, let ok = s.lastSuccessAt, now.timeIntervalSince(ok) > s.intervalSeconds * 4 + 3600 {
+                    stale += 1
+                    if out.count < 7 { item("来源很久没有更新检查：\(s.name)", "属于关注“\(w.title)”。上次成功读取在 \(ok.formatted(date: .abbreviated, time: .shortened))，已超过检查间隔的 4 倍。", url: link, date: ok) }
+                }
+            }
+        }
+        let head = Evidence(id: "", title: "Radar 当前运行概况", url: "", origin: "Radar 状态", date: now,
+                            text: "共 \(watches.count) 个关注、\(total) 个来源；读取失败 \(bad) 个，长期未更新 \(stale) 个。" + lines.prefix(12).joined(separator: "；"),
+                            meta: "", isEvent: false, kind: "status")
+        return [head] + out
+    }
+
+    /// Lexical retrieval over what Radar already stored. `previous` keeps earlier numbering so follow-ups can refer to it.
+    public func retrieve(question: String, extraTerms: [String], watchID: Int64?, range: TimeRange?, previous: [Evidence], now: Date = Date(), maxNew: Int = 10) throws -> Retrieval {
         let follow = !previous.isEmpty && Self.followMarkers.contains { question.contains($0) }
-        let toks = Self.tokens(question)
+        var toks = Self.tokens(question)
+        let named = !toks.isEmpty
+        for t in extraTerms where !toks.contains(t) { toks.append(t) }
+        let about = Self.isAboutRadar(question)
         let since = (range ?? Self.detectRange(question) ?? .all).since(now)
-        return try store.db.read { db in
+        return try store.db.read { db -> Retrieval in
             let titles = try watchTitles(db)
             var out = previous, seen = Set(previous.map { $0.url })
             func take(_ e: Evidence) { var e = e; e.id = "S\(out.count + 1)"; out.append(e); seen.insert(e.url) }
             func hits(_ hay: String) -> Int { let h = hay.lowercased(); return toks.reduce(0) { $0 + (h.contains($1) ? 1 : 0) } }
+            if about && !previous.contains(where: { $0.kind == "status" }) { for e in try statusEvidence(db, watchID: watchID, now: now) { take(e) } }
             // recent events that match
             var evq = Event.order(Column("createdAt").desc)
             if let w = watchID { evq = evq.filter(Column("watchID") == w) }
@@ -171,13 +237,16 @@ public final class RadarAssistant {
             }.sorted { $0.1 > $1.1 }
             // when anything matches the question, unrelated items are noise; with no match at all fall back to freshness
             let anyMatch = scored.contains { $0.2 > 0 }
-            let ranked = scored.filter { !follow && !anyMatch || $0.2 > 0 }
+            // a question that names something nothing mentions gets no filler: unrelated items only invite a made-up answer
+            let eventHit = out.count > previous.count && out.contains { $0.isEvent }
+            let matched = follow || about || anyMatch || eventHit || !named
+            let ranked = scored.filter { !follow && !anyMatch && matched || $0.2 > 0 }
             var added = 0
             for (r, _, _) in ranked where added < (follow ? 3 : maxNew) && out.count < 18 {
                 if seen.contains(r.entry.canonicalURL) { continue }
                 take(evidence(r, id: "")); added += 1
             }
-            return out
+            return Retrieval(evidence: out, matched: matched)
         }
     }
 
@@ -186,7 +255,7 @@ public final class RadarAssistant {
     static let rules = """
         你是 Radar 的本地信息助手。只能依据下面“资料”作答，资料里没有的内容不要编造，也不要使用你自己的记忆补充项目或事实。\
         每条结论后面用 [S编号] 标注来源，只能使用资料中出现的编号，不要自己写链接。\
-        资料分两类：“事件”是 Radar 检测到的真实新变化；“已发现内容”是已采集的信息，包含首次采集建立的基线，不等于近期新增，不要把它们说成“新增”或“新发布”。\
+        资料分三类：“Radar 自身状态”描述 Radar 本身的运行情况（来源是否读取失败等），回答关于 Radar 的问题时使用；“事件”是 Radar 检测到的真实新变化；“已发现内容”是已采集的信息，包含首次采集建立的基线，不等于近期新增，不要把它们说成“新增”或“新发布”。\
         不要根据简短描述推断兼容性、性能或功能是否完整；资料没写的就说“资料中未说明”。\
         不要补充资料里没有的评价（例如文档是否完善、社区是否活跃、生态是否开放、是否适合某场景），需要判断时只说资料能支持的部分。\
         如果资料不足以回答，直接说明现有资料掌握了什么、缺什么。回答要简洁：通常不超过 8 条，每条一两句话，不要重复提问，不要附加统计信息。用中文回答，使用 Markdown。
@@ -196,7 +265,7 @@ public final class RadarAssistant {
         let cap = max(120, min(500, budget / max(1, evidence.count) - 140))
         let f = DateFormatter(); f.dateFormat = "yyyy-MM-dd"
         return evidence.map { e in
-            let head = [e.isEvent ? "事件·\(kindLabel[e.kind] ?? "更新")" : "已发现内容", e.date.map { "时间 " + f.string(from: $0) }, "来源 " + e.origin,
+            let head = [e.isEvent ? "事件·\(kindLabel[e.kind] ?? "更新")" : (e.kind == "status" ? "Radar 自身状态" : "已发现内容"), e.date.map { "时间 " + f.string(from: $0) }, "来源 " + e.origin,
                         e.meta.isEmpty ? nil : e.meta].compactMap { $0 }.joined(separator: " | ")
             return "[\(e.id)] (\(head))\n标题：\(e.title)\n内容：\(clip(e.text, cap))"
         }.joined(separator: "\n\n")
