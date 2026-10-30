@@ -140,7 +140,7 @@ public final class RadarAssistant {
         }
         if word.count >= 2 { out.append(word) }; flushCJK()
         var seen = Set<String>()
-        return out.filter { !stop.contains($0) && !genericTerms.contains($0) && seen.insert($0).inserted }
+        return out.filter { !stop.contains($0) && seen.insert($0).inserted }
     }
 
     public struct Retrieval {
@@ -171,7 +171,7 @@ public final class RadarAssistant {
         var seen = Set<String>()
         return line.split(whereSeparator: { ",，;；\n".contains($0) }).map {
             $0.trimmingCharacters(in: CharacterSet(charactersIn: " \t\"'“”`*-•0123456789.、)）(（")).lowercased()
-        }.filter { $0.count >= 2 && $0.count <= 40 && !stop.contains($0) && seen.insert($0).inserted }.prefix(14).map { $0 }
+        }.filter { $0.count >= 2 && $0.count <= 40 && !stop.contains($0) && !genericTerms.contains($0) && seen.insert($0).inserted }.prefix(14).map { $0 }
     }
 
     // MARK: Radar's own state ("which sources fail?")
