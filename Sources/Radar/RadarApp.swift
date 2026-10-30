@@ -45,6 +45,7 @@ struct SettingsView: View {
         .onAppear {   // a scratch database (RADAR_DB) never touches the real Keychain
             guard !model.isolated else { return }
             token = Keychain.get() ?? ""; searchKey = Keychain.get(Keychain.searchService) ?? ""
+            model.adopt(token: token, searchKey: searchKey)
         }
     }
 }

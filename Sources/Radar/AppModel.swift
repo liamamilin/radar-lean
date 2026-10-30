@@ -6,6 +6,10 @@ import Security
 import os
 
 enum Keychain {
+    /// The keychain only prompts for an app whose code hash it has not seen, and every rebuild has a new one. So it is read at launch
+    /// only when the user saved something there (remembered here); everyone else never meets the dialog.
+    static func holds(_ service: String) -> Bool { UserDefaults.standard.bool(forKey: "keychain." + service) }
+    static func remember(_ service: String, _ has: Bool) { UserDefaults.standard.set(has, forKey: "keychain." + service) }
     static let service = "app.radar.github-token"
     static let searchService = "app.radar.search-key"
     static func get(_ service: String = Keychain.service) -> String? {
@@ -57,12 +61,12 @@ final class AppModel: NSObject, ObservableObject, UNUserNotificationCenterDelega
         discovery = Discovery(fetcher: fetcher, store: store)
         ai = AssistantModel(store: store)
         super.init()
-        tokenBox.value = ProcessInfo.processInfo.environment["GITHUB_TOKEN"] ?? (isolated ? nil : Keychain.get())
+        tokenBox.value = ProcessInfo.processInfo.environment["GITHUB_TOKEN"] ?? (isolated || !Keychain.holds(Keychain.service) ? nil : Keychain.get())
         engine.onChecking = { [weak self] id, on in
             DispatchQueue.main.async { if on { self?.busySources.insert(id) } else { self?.busySources.remove(id) } }
         }
         self.tokenBox = tokenBox
-        searchBox.value = ProcessInfo.processInfo.environment["EXA_API_KEY"] ?? (isolated ? nil : Keychain.get(Keychain.searchService))
+        searchBox.value = ProcessInfo.processInfo.environment["EXA_API_KEY"] ?? (isolated || !Keychain.holds(Keychain.searchService) ? nil : Keychain.get(Keychain.searchService))
         self.searchBox = searchBox
         observer = DatabaseRegionObservation(tracking: Watch.all(), Source.all(), Event.all(), Entry.all(), WatchSource.all())
             .start(in: store.db, onError: { _ in }, onChange: { [weak self] _ in
@@ -91,8 +95,13 @@ final class AppModel: NSObject, ObservableObject, UNUserNotificationCenterDelega
     private var tokenBox: TokenBox!
     private var searchBox: TokenBox!
     var searchEnabled: Bool { !(searchBox.value ?? "").isEmpty }
-    func setSearchKey(_ t: String) { Keychain.set(t, Keychain.searchService); searchBox.value = t.isEmpty ? nil : t }
-    func setToken(_ t: String) { Keychain.set(t); tokenBox.value = t.isEmpty ? nil : t }
+    func setSearchKey(_ t: String) { Keychain.set(t, Keychain.searchService); Keychain.remember(Keychain.searchService, !t.isEmpty); searchBox.value = t.isEmpty ? nil : t }
+    func setToken(_ t: String) { Keychain.set(t); Keychain.remember(Keychain.service, !t.isEmpty); tokenBox.value = t.isEmpty ? nil : t }
+    /// Settings was opened (the user's own action, so a keychain prompt is fine): pick up what is stored there.
+    func adopt(token t: String, searchKey k: String) {
+        if !t.isEmpty { Keychain.remember(Keychain.service, true); tokenBox.value = t }
+        if !k.isEmpty { Keychain.remember(Keychain.searchService, true); searchBox.value = k }
+    }
 
     func changed() {
         revision += 1
