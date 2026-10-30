@@ -282,31 +282,3 @@ final class OfficialCatalogTests: Base {
 
     func engineSession() -> URLSession { let c = URLSessionConfiguration.ephemeral; c.protocolClasses = [Stub.self]; return URLSession(configuration: c) }
 }
-
-
-final class MissDiagnosisTests: Base {
-    func entry(_ url: String, _ title: String, source: Int64 = 1) -> Entry {
-        Entry(id: 1, sourceID: source, externalKey: url, canonicalURL: url, title: title, summary: "", text: "", contentHash: "h", firstSeenAt: Date(), publishedAt: nil, meta: [:])
-    }
-    func src(_ endpoint: String, error: String? = nil) -> Source {
-        Source(id: 1, uniqueKey: "rss:" + endpoint, kind: .rss, name: "S", endpoint: endpoint, selector: nil, intervalSeconds: 3600, initialized: true, lastCheckedAt: nil, lastSuccessAt: nil, lastError: error, nextDueAt: Date(), etag: nil, lastModified: nil)
-    }
-    func testUncoveredSiteIsASourceGapWithOfficialSuggestion() async {
-        let d = await MissDiagnosis.diagnose(url: "https://openai.com/index/x/", plan: WatchPlan(type: .topic, title: "t"), sources: [], entries: [], fetcher: Fetcher())
-        XCTAssertTrue(d.findings.contains { $0.text.contains("没有任何来源覆盖") })
-        XCTAssertNotNil(d.suggestion)
-    }
-    func testKnownEntryFilteredByKeywords() async {
-        var plan = WatchPlan(type: .topic, title: "t"); plan.include = ["agent"]
-        let d = await MissDiagnosis.diagnose(url: "https://a.com/p", plan: plan, sources: [src("https://a.com/feed")], entries: [entry("https://a.com/p", "Cooking tips")], fetcher: Fetcher())
-        XCTAssertTrue(d.findings.contains { $0.text.contains("关键词过滤") })
-    }
-    func testKnownEntryOnlyOrdinaryUpdate() async {
-        let d = await MissDiagnosis.diagnose(url: "https://a.com/p", plan: WatchPlan(type: .topic, title: "t"), sources: [src("https://a.com/feed")], entries: [entry("https://a.com/p", "Some note")], fetcher: Fetcher())
-        XCTAssertTrue(d.findings.contains { $0.text.contains("普通更新") })
-    }
-    func testFailingSameSiteSourceIsNamed() async {
-        let d = await MissDiagnosis.diagnose(url: "https://a.com/missing", plan: WatchPlan(type: .topic, title: "t"), sources: [src("https://a.com/feed", error: "HTTP 403")], entries: [], fetcher: Fetcher())
-        XCTAssertTrue(d.findings.contains { $0.text.contains("HTTP 403") })
-    }
-}

@@ -77,12 +77,13 @@ struct WatchDetailView: View {
                             VStack(alignment: .leading, spacing: 6) {
                                 Text(ent.name).font(.headline)
                                 ForEach(ent.channels, id: \.spec.uniqueKey) { ch in
-                                    let attached = sources.contains { $0.uniqueKey == ch.spec.uniqueKey }
+                                    let src = sources.first { $0.uniqueKey == ch.spec.uniqueKey }
                                     HStack {
-                                        Image(systemName: attached ? "checkmark.circle.fill" : "circle").foregroundStyle(attached ? .green : .secondary)
+                                        Image(systemName: coverageIcon(src)).foregroundStyle(coverageColor(src))
                                         Text(ch.spec.name); Text(ch.role).font(.caption).foregroundStyle(.secondary)
                                         Spacer()
-                                        if !attached { Button("添加") { attachOfficial(ch.spec) } }
+                                        Text(coverageText(src)).font(.caption).foregroundStyle(coverageColor(src)).lineLimit(2)
+                                        if src == nil { Button("添加") { attachOfficial(ch.spec) } }
                                     }
                                 }
                                 ForEach(ent.unreadable, id: \.url) { u in
@@ -90,22 +91,10 @@ struct WatchDetailView: View {
                                 }
                             }.padding(.vertical, 2)
                         }
-                        Text("这是 Radar 已确认能读到的官方渠道。标成橙色的是已知读不了的渠道，Radar 在这些地方是盲区。").font(.caption).foregroundStyle(.secondary)
+                        Text("这是 Radar 已确认能读到的官方渠道。“已接入”只表示 Radar 在读它，不等于覆盖了它的全部信息；橙色是读取失败或已知读不了的渠道，Radar 在这些地方是盲区。").font(.caption).foregroundStyle(.secondary)
                     }
                 }
-                Section("漏报分析") {
-                    HStack {
-                        TextField("贴一个你看到、但 Radar 没提醒你的链接", text: $missURL).onSubmit(diagnose)
-                        Button(missBusy ? "分析中…" : "分析", action: diagnose).disabled(missURL.isEmpty || missBusy)
-                    }
-                    if let miss {
-                        ForEach(Array(miss.findings.enumerated()), id: \.offset) { _, f in
-                            Label(f.text, systemImage: f.ok ? "checkmark.circle" : "exclamationmark.triangle")
-                                .font(.callout).foregroundStyle(f.ok ? Color.secondary : Color.orange)
-                        }
-                        if let sp = miss.suggestion { Button("添加官方来源：\(sp.name)") { attachOfficial(sp) } }
-                    }
-                }
+                missSection
                 Section("已发现内容（\(entries.count)）") {
                     if entries.isEmpty { Text("来源尚未成功读取").foregroundStyle(.secondary) }
                     ForEach(entries, id: \.0.id) { e, s in entryRow(e, s) }
@@ -181,13 +170,53 @@ struct WatchDetailView: View {
         guard let watch else { return [] }
         return OfficialCatalog.entities(in: watch.title + " " + watch.originalText)
     }
+    var missSection: some View {
+        Section("漏报分析") {
+            HStack {
+                TextField("贴一个你看到、但 Radar 没提醒你的链接", text: $missURL).onSubmit(diagnose)
+                Button(missBusy ? "分析中…" : "分析", action: diagnose).disabled(missURL.isEmpty || missBusy)
+            }
+            if let miss {
+                ForEach(Array(miss.findings.enumerated()), id: \.offset) { _, f in
+                    VStack(alignment: .leading, spacing: 4) {
+                        Label(f.text, systemImage: f.ok ? "checkmark.circle" : "exclamationmark.triangle")
+                            .font(.callout).foregroundStyle(f.ok ? Color.secondary : Color.orange)
+                        if let a = f.action { Button(a.label) { perform(a.action) } }
+                    }
+                }
+            }
+        }
+    }
+    func coverageText(_ s: Source?) -> String {
+        guard let s else { return "未接入" }
+        if let e = s.lastError { return "已接入，最近读取失败：\(e)" }
+        if !s.initialized { return "已接入，尚未完成首次读取" }
+        return "已接入，读取正常" + (s.lastSuccessAt.map { " · " + $0.formatted(date: .omitted, time: .shortened) } ?? "")
+    }
+    func coverageIcon(_ s: Source?) -> String {
+        guard let s else { return "circle" }
+        return s.lastError != nil ? "exclamationmark.circle.fill" : (s.initialized ? "checkmark.circle.fill" : "clock")
+    }
+    func coverageColor(_ s: Source?) -> Color {
+        guard let s else { return .secondary }
+        return s.lastError != nil ? .orange : (s.initialized ? .green : .secondary)
+    }
     func diagnose() {
-        guard let watch, !missBusy else { return }
+        guard !missBusy else { return }
         missBusy = true; miss = nil
-        let all = entries.map { $0.0 }, srcs = sources, p = watch.plan, u = missURL
+        let u = missURL, store = model.store, id = watchID
         Task {
-            miss = await MissDiagnosis.diagnose(url: u, plan: p, sources: srcs, entries: all, fetcher: Fetcher())
+            miss = await MissDiagnosis.diagnose(url: u, watchID: id, store: store, fetcher: Fetcher())
             missBusy = false
+        }
+    }
+    func perform(_ a: MissDiagnosis.Action) {
+        guard let watch else { return }
+        switch a {
+        case .addSource(let spec), .linkSource(let spec): attachOfficial(spec)
+        case .addInclude(let w): includeText = includeText.isEmpty ? w : includeText + ", " + w; save()
+        case .enableNotify: plan.notify = true; save()
+        case .resume: model.setStatus(watch, active: true)
         }
     }
     func attachOfficial(_ spec: SourceSpec) {

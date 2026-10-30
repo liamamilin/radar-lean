@@ -40,6 +40,7 @@ public struct WatchPlan: Codable, Equatable {
     public var notify = true
     public var minStars: Int?          // GitHub 新项目的 Stars 门槛（空 = 默认 50）
     public var unsupported: [String]?  // 听懂但无法自动判断的条件，原样展示给用户
+    public var focus: [String]?        // 用户说“包括价格、额度…”：这些主题的内容算重要更新（不用于过滤；include 才是关注对象）
     public init(type: PlanType, title: String) { self.type = type; self.title = title }
 }
 
@@ -226,6 +227,9 @@ public final class Store {
             }
             try db.execute(sql: "INSERT INTO summaryHistory (key, json) SELECT key, json FROM summaryCache")
         }
+        m.registerMigration("v7") { db in   // list sources now include their selector in the key (js: lists)
+            try db.execute(sql: "UPDATE source SET uniqueKey = uniqueKey || '#' || selector WHERE kind = 'list' AND selector IS NOT NULL AND selector <> '' AND uniqueKey NOT LIKE '%#%'")
+        }
         try m.migrate(db)
     }
 
@@ -300,7 +304,7 @@ public struct SourceSpec: Hashable, Codable {
         case .rss: return "rss:" + normalizeURL(endpoint)
         case .json: return "json:" + normalizeURL(endpoint) + "#" + (selector ?? "")
         case .hackerNews: return "hn:" + endpoint.lowercased().split(separator: " ").joined(separator: " ")
-        case .list: return "list:" + normalizeURL(endpoint)
+        case .list: return "list:" + normalizeURL(endpoint) + ((selector ?? "").isEmpty ? "" : "#" + selector!)   // a static list and a js: list of the same URL are different sources
         case .web: return "web:" + normalizeURL(endpoint) + "#" + (selector ?? "default")
         }
     }

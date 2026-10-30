@@ -310,7 +310,10 @@ public final class Fetcher {
             guard let title = fill(m["title"], item), !title.isEmpty, let key = fill(m["id"], item).flatMap({ $0.isEmpty ? nil : $0 }) ?? link else { return nil }
             var e = FetchedEntry(externalKey: "json:" + key, url: link ?? urlString, title: title, summary: String((fill(m["summary"], item) ?? "").prefix(500)))
             e.publishedAt = date(dig(item, m["date"] ?? ""))
-            for (k, v) in item { if let s = str(v), s.count < 80, !(v is [Any]) { e.meta[k] = s } }
+            for (k, v) in item {
+                if let a = v as? [String] { e.meta[k] = String(a.joined(separator: ",").prefix(400)) }   // e.g. a model's tags
+                else if let s = str(v), s.count < 80, !(v is [Any]) { e.meta[k] = s }
+            }
             return e
         }
         guard !entries.isEmpty || list.isEmpty else { throw RadarError.parse("JSON 条目缺少 title / id 字段，请检查字段映射") }

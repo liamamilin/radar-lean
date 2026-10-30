@@ -129,19 +129,40 @@ public enum PlanParser {
             plan.exclude = splitList(ex).filter { !$0.contains("预发布") }
         }
         if let inc = clause(after: ["尤其是", "特别是", "优先", "重点是", "重点关注", "关键词", "especially ", "focus on ", "keywords:"], in: t) {
-            plan.include = splitList(inc.replacingOccurrences(of: "的", with: ""))
+            plan.include = splitList(inc.replacingOccurrences(of: "的", with: "").replacingOccurrences(of: "支持", with: "").replacingOccurrences(of: "适合", with: ""))
         }
         if plan.type == .feed || plan.type == .webpage,
            plan.include.isEmpty, let about = clause(after: ["关于", "about "], in: t) {
             plan.include = splitList(about.replacingOccurrences(of: "的新文章", with: "").replacingOccurrences(of: "有", with: "")).filter { $0.count < 24 }
         }
-        if plan.type == .topic, plan.include.isEmpty, let list = clause(after: ["关注", "关于", "follow ", "watch "], in: t) {
-            // "关注 a, b, c 等等…的最新信息": keep the listed names, drop the trailing description
-            plan.include = splitList(list).map { $0.components(separatedBy: "等").first ?? $0 }
-                .map { $0.trimmingCharacters(in: .whitespaces) }.filter { w in !w.isEmpty && w.count < 24 && w.allSatisfy(\.isASCII) }
+        if plan.type == .topic, plan.include.isEmpty {
+            // "关注 ChatGPT、Claude、Codex 的最新动态，包括价格、额度…": the names are the subjects, what follows "包括" is what to watch for
+            let (subjects, focus) = subjectsAndFocus(in: t)
+            plan.include = subjects
+            plan.focus = focus.isEmpty ? nil : focus
             if plan.title == "新关注", !plan.include.isEmpty { plan.title = plan.include.prefix(3).joined(separator: " / ") + " 动态" }
         }
         return plan
+    }
+
+    /// The product / company names the watch is about, and the topics it should pay attention to ("包括 / including …").
+    static func subjectsAndFocus(in text: String) -> (subjects: [String], focus: [String]) {
+        var body = text
+        if let r = ["关注", "关于", "follow ", "watch "].compactMap({ body.range(of: $0, options: .caseInsensitive) }).min(by: { $0.lowerBound < $1.lowerBound }) {
+            body = String(body[r.upperBound...])
+        } else if !(body.first?.isASCII ?? false) { return ([], []) }   // no marker: only a list that starts with a name
+        if let end = body.firstIndex(where: { "。.;；\n".contains($0) }) { body = String(body[..<end]) }
+        var focusPart = ""
+        if let r = body.range(of: #"[，,]?\s*(包括|包含|尤其是|特别是|重点是|including )"#, options: [.regularExpression, .caseInsensitive]) {
+            focusPart = String(body[r.upperBound...]); body = String(body[..<r.lowerBound])
+        }
+        // the descriptive tail ("的最新动态", "等等") is not part of a name
+        var cut = body.endIndex
+        for m in ["的最新", "最新", "的动态", "动态", "的更新", "的消息", "的信息", "的公告", "等"] { if let r = body.range(of: m), r.lowerBound < cut { cut = r.lowerBound } }
+        let subjects = splitList(String(body[..<cut])).map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty && $0.count < 24 && $0.allSatisfy(\.isASCII) }
+        let focus = splitList(focusPart.replacingOccurrences(of: "的", with: "")).map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty && $0.count < 12 }
+        return (subjects, focus)
     }
 
     static func topicTitle(_ t: String) -> String {
@@ -196,6 +217,8 @@ public enum Keywords {
         "智能体": ["agent"], "代理": ["agent"],
         "agent": ["agentic", "claude code", "codex", "harness"], "agents": ["agentic", "claude code", "codex", "harness"],
         "mcp": ["model context protocol"],
+        "本地部署": ["local llm", "local model", "locally", "on-device", "ollama", "gguf", "llama.cpp", "lm studio", "mlx"], "本地部署模型": ["local llm", "local model", "locally", "on-device", "ollama", "gguf", "llama.cpp", "lm studio", "mlx"],
+        "价格": ["pricing", "price"], "额度": ["quota", "usage limit", "credits", "rate limit", "allowance"], "套餐": ["subscription", "pricing plan", "tier"],
     ]
     public static func expand(_ k: String) -> [String] {
         let l = k.lowercased().trimmingCharacters(in: .whitespaces)

@@ -84,6 +84,12 @@ public final class Engine {
                     e.meta = fe.meta; e.summary = fe.summary; e.title = fe.title
                     try e.update(db)
                     if prev["stars"] != fe.meta["stars"] { changes.append((e, .metrics(previous: prev))) }
+                } else if src.kind == .json && (e.meta != fe.meta || e.summary != fe.summary) {
+                    // an already-known item keeps its figures current (likes, downloads …); rules decide whether the move matters
+                    let prev = e.meta
+                    e.meta = fe.meta; e.summary = fe.summary; e.title = fe.title
+                    try e.update(db)
+                    if prev["likes"] != fe.meta["likes"] { changes.append((e, .metrics(previous: prev))) }
                 }
             } else {
                 var e = Entry(id: nil, sourceID: sourceID, externalKey: fe.externalKey, canonicalURL: fe.url, title: fe.title,
@@ -101,8 +107,9 @@ public final class Engine {
             let links = try WatchSource.filter(Column("sourceID") == sourceID && Column("baselineReady") == true).fetchAll(db)
             for link in links {
                 guard let w = try Watch.fetchOne(db, key: link.watchID), w.isActive else { continue }
+                let official = OfficialCatalog.entities(in: w.title + " " + w.originalText).first { $0.channels.contains { $0.spec.uniqueKey == src.uniqueKey } }?.aliases
                 for (entry, change) in changes {
-                    guard let j = Self.evaluate(plan: w.plan, kind: src.kind, entry: entry, change: change, previous: prevVersion) else { continue }
+                    guard let j = Self.evaluate(plan: w.plan, kind: src.kind, entry: entry, change: change, previous: prevVersion, official: official) else { continue }
                     let type: String
                     switch change { case .new: type = "new"; case .changed: type = "changed"; case .metrics: type = "metrics" }
                     var mk = mergeKey(entry.canonicalURL)
@@ -210,10 +217,17 @@ public final class Engine {
         return ageDays <= 14 ? stars >= max(10, need / 5) : stars >= need
     }
 
-    static func evaluate(plan: WatchPlan, kind: SourceKind, entry: Entry, change: Change, previous: Version? = nil) -> Judged? {
+    /// `official`: the names of the entity this source is an official channel of (for a watch that is about it), nil for any other source.
+    /// An official channel speaks for its entity, so its content is not filtered by the product names the user typed.
+    static func evaluate(plan: WatchPlan, kind: SourceKind, entry: Entry, change: Change, previous: Version? = nil, official: [String]? = nil, now: Date = Date()) -> Judged? {
         let hay = entry.title + " " + entry.summary + " " + (kind == .web ? "" : entry.text)
         func relevant(_ text: String) -> Bool {
             (plan.exclude.isEmpty || !Keywords.matches(text, any: plan.exclude)) && (plan.include.isEmpty || Keywords.matches(text, any: plan.include))
+        }
+        let excluded = !plan.exclude.isEmpty && Keywords.matches(hay, any: plan.exclude)
+        /// Is this about what the watch follows? An official channel also counts when it names its own company.
+        func about(_ text: String) -> Bool {
+            relevant(text) || (official.map { Keywords.matches(text, any: $0.filter { !["openai", "anthropic"].contains($0) }) } ?? false)   // a company's own posts all say its name
         }
         switch kind {
         case .githubReleases:
@@ -253,15 +267,20 @@ public final class Engine {
             let lang = entry.meta["language"].flatMap { $0.isEmpty ? nil : " · " + $0 } ?? ""
             if let was = rising { return Judged(reason: "项目升温 · ★\(was) → ★\(stars) · 创建 \(Int(age)) 天\(lang)", kind: "newProject") }
             return Judged(reason: "新项目 · 创建 \(Int(age)) 天 · ★\(stars)\(lang)", kind: "newProject")
-        case .rss, .list, .hackerNews, .json:
+        case .hackerNews:
             guard relevant(hay) else { return nil }
-            let t = entry.title.lowercased()
-            if isPricingNews(entry.title) { return Judged(reason: "价格 / 额度 / 套餐相关", kind: "majorUpdate") }
-            let major = majorWords.contains { t.contains($0) }
-            return Judged(reason: kind == .list ? "列表页新条目" : "新文章", kind: major ? "majorUpdate" : "update")
+            return judgeHackerNews(entry)
+        case .json:
+            if entry.meta["likes"] != nil, entry.meta["downloads"] != nil, entry.meta["createdAt"] != nil { return judgeModel(plan: plan, entry: entry, change: change, now: now) }
+            guard case .new = change, !excluded, relevant(hay) else { return nil }
+            return judgeArticle(plan: plan, kind: kind, entry: entry, about: true)
+        case .rss, .list:
+            guard case .new = change, !excluded else { return nil }
+            if official == nil && !relevant(hay) { return nil }
+            return judgeArticle(plan: plan, kind: kind, entry: entry, about: official == nil || about(hay), official: official != nil)
         case .web:
             guard case .changed(let before) = change else { return nil }
-            guard relevant(entry.text) else { return nil }
+            guard !excluded, official != nil || relevant(entry.text) else { return nil }
             let (b, a) = diffSnippets(before, entry.text)
             return Judged(reason: "页面正文发生变化", kind: "pageChange", before: b, after: a)
         }
