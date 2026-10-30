@@ -17,6 +17,9 @@ struct WatchDetailView: View {
     @State private var nlMessage: String?
     @State private var addURL = ""
     @State private var addMessage: String?
+    @State private var missURL = ""
+    @State private var miss: MissDiagnosis?
+    @State private var missBusy = false
     @State private var tracking: Set<String> = []
 
     var body: some View {
@@ -88,6 +91,19 @@ struct WatchDetailView: View {
                             }.padding(.vertical, 2)
                         }
                         Text("这是 Radar 已确认能读到的官方渠道。标成橙色的是已知读不了的渠道，Radar 在这些地方是盲区。").font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+                Section("漏报分析") {
+                    HStack {
+                        TextField("贴一个你看到、但 Radar 没提醒你的链接", text: $missURL).onSubmit(diagnose)
+                        Button(missBusy ? "分析中…" : "分析", action: diagnose).disabled(missURL.isEmpty || missBusy)
+                    }
+                    if let miss {
+                        ForEach(Array(miss.findings.enumerated()), id: \.offset) { _, f in
+                            Label(f.text, systemImage: f.ok ? "checkmark.circle" : "exclamationmark.triangle")
+                                .font(.callout).foregroundStyle(f.ok ? Color.secondary : Color.orange)
+                        }
+                        if let sp = miss.suggestion { Button("添加官方来源：\(sp.name)") { attachOfficial(sp) } }
                     }
                 }
                 Section("已发现内容（\(entries.count)）") {
@@ -164,6 +180,15 @@ struct WatchDetailView: View {
     var officialEntities: [OfficialEntity] {
         guard let watch else { return [] }
         return OfficialCatalog.entities(in: watch.title + " " + watch.originalText)
+    }
+    func diagnose() {
+        guard let watch, !missBusy else { return }
+        missBusy = true; miss = nil
+        let all = entries.map { $0.0 }, srcs = sources, p = watch.plan, u = missURL
+        Task {
+            miss = await MissDiagnosis.diagnose(url: u, plan: p, sources: srcs, entries: all, fetcher: Fetcher())
+            missBusy = false
+        }
     }
     func attachOfficial(_ spec: SourceSpec) {
         guard let src = try? model.store.attach(watchID: watchID, spec: spec) else { return }
