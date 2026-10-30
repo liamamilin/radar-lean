@@ -140,7 +140,7 @@ public final class RadarAssistant {
         }
         if word.count >= 2 { out.append(word) }; flushCJK()
         var seen = Set<String>()
-        return out.filter { !stop.contains($0) && seen.insert($0).inserted }
+        return out.filter { !stop.contains($0) && !genericTerms.contains($0) && seen.insert($0).inserted }
     }
 
     public struct Retrieval {
@@ -155,12 +155,15 @@ public final class RadarAssistant {
     // MARK: query expansion (the stored content is mostly English, the questions are often Chinese)
 
     /// Only worth a model call when the question has CJK text and so cannot match English titles directly.
-    public static func needsExpansion(_ q: String) -> Bool { q.unicodeScalars.contains { (0x4E00...0x9FFF).contains($0.value) } }
+    public static func needsExpansion(_ q: String) -> Bool { !isAboutRadar(q) && q.unicodeScalars.contains { (0x4E00...0x9FFF).contains($0.value) } }
 
     public static func expandMessages(_ q: String) -> [ChatMessage] {
         [ChatMessage(role: "system", content: "你把用户的问题改写成用于检索英文科技资讯标题的关键词。输出 6 到 12 个英文关键词或短语（含常见同义词和产品名），用英文逗号分隔，只输出关键词，不要解释。例如问题“OpenAI 额度有什么变化”输出：openai, usage limit, quota, pricing, credits, plan, codex, chatgpt"),
          ChatMessage(role: "user", content: q)]
     }
+
+    /// Words a model adds for coverage that match almost any tech headline; they would make "nothing found" impossible.
+    static let genericTerms: Set<String> = ["development", "progress", "latest news", "news", "update", "updates", "research", "research update", "breakthroughs", "breakthrough", "policy change", "api update", "policy", "technology", "tech", "ai", "software", "open source", "open-source", "tools", "tool", "release", "new", "announcement", "model", "models"]
 
     /// Model output -> search terms. Defensive: models add numbering, quotes or a lead-in sentence.
     public static func parseTerms(_ raw: String) -> [String] {

@@ -111,6 +111,8 @@ final class AssistantTests: Base {
         let a = RadarAssistant(store: store)
         XCTAssertTrue(RadarAssistant.needsExpansion("额度有什么变化"))
         XCTAssertFalse(RadarAssistant.needsExpansion("usage limit"))
+        XCTAssertFalse(RadarAssistant.needsExpansion("哪些来源读取失败了"))     // about Radar itself: no search terms needed
+        XCTAssertEqual(RadarAssistant.parseTerms("quantum computing, development, progress, qubit"), ["quantum computing", "qubit"])
         let plain = try a.retrieve(question: "额度有什么变化", extraTerms: [], watchID: nil, range: nil, previous: [])
         XCTAssertFalse(plain.matched)                                   // nothing matches, and no filler is offered
         let terms = RadarAssistant.parseTerms("好的，关键词如下：\n1. usage limit, quota, \"pricing\", Codex")
