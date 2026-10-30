@@ -64,7 +64,12 @@ scripts/build_app.sh        # 生成 dist/Radar.app
 open dist/Radar.app
 ```
 
-构建产物是 ad-hoc 签名；第一次读取钥匙串（如保存了 GitHub Token）时系统会询问，选“始终允许”即可。
+构建产物默认是 ad-hoc 签名；第一次读取钥匙串（如保存了 GitHub Token）时系统会询问，选“始终允许”即可。
+ad-hoc 签名每次重新构建都会变，钥匙串会再问一次；想避免的话，用你自己钥匙串里的代码签名证书构建（先 `security find-identity -v -p codesigning` 查看证书名）：
+
+```bash
+RADAR_SIGN_IDENTITY="你的证书名" scripts/build_app.sh
+```
 
 ### 第一次使用
 
