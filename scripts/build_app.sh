@@ -16,13 +16,15 @@ cat > "$APP/Contents/Info.plist" <<PL
 <key>CFBundleIdentifier</key><string>app.radar.Radar</string>
 <key>CFBundleExecutable</key><string>Radar</string>
 <key>CFBundlePackageType</key><string>APPL</string>
-<key>CFBundleShortVersionString</key><string>0.1</string>
+<key>CFBundleIconFile</key><string>AppIcon</string>
+<key>CFBundleShortVersionString</key><string>${RADAR_VERSION:-0.2}</string>
 <key>CFBundleVersion</key><string>1</string>
 <key>LSMinimumSystemVersion</key><string>15.0</string>
 <key>NSHighResolutionCapable</key><true/>
 <key>NSPrincipalClass</key><string>NSApplication</string>
 </dict></plist>
 PL
+[ -f assets/AppIcon.icns ] && cp assets/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
 for b in "$(dirname "$BIN")"/*.bundle; do case "$b" in *Tests*) ;; *) cp -R "$b" "$APP/Contents/Resources/";; esac; done
 # A stable identity keeps the Keychain "Always Allow" valid across rebuilds; ad-hoc (-) changes it every build.
 codesign --force --deep --sign "${RADAR_SIGN_IDENTITY:--}" "$APP"

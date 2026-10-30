@@ -35,7 +35,7 @@ struct ContentView: View {
             case .watch(let id): WatchDetailView(watchID: id, selection: $selection).id(id)
             case .briefing: BriefingView()
             case .ask(let scope): AskRadarView(scope: scope).id(scope)
-            default: UpdatesView()
+            default: UpdatesView(onNew: { showNew = true })
             }
         }
         .toolbar {
@@ -186,9 +186,13 @@ struct UpdatesView: View {
     @EnvironmentObject var model: AppModel
     @State private var events: [Event] = []
     @State private var titles: [Int64: String] = [:]
+    @State private var loaded = false
+    var onNew: () -> Void = {}
     var body: some View {
         Group {
-            if events.isEmpty {
+            if loaded && titles.isEmpty && events.isEmpty {
+                WelcomeView(ai: model.ai, onNew: onNew)
+            } else if events.isEmpty {
                 ContentUnavailableView("暂无更新", systemImage: "bell", description: Text("首次读取只建立基线，之后出现的新内容会显示在这里。"))
             } else {
                 List(events) { e in
@@ -205,6 +209,45 @@ struct UpdatesView: View {
             let r = try? await model.store.db.read { db in (try Event.order(Column("createdAt").desc).limit(300).fetchAll(db), try Watch.fetchAll(db)) }
             events = r?.0 ?? []
             titles = Dictionary(uniqueKeysWithValues: (r?.1 ?? []).map { ($0.id!, $0.title) })
+            loaded = r != nil
+        }
+    }
+}
+
+/// Shown until the first watch exists: the three things a new user has to do, with live status.
+struct WelcomeView: View {
+    @EnvironmentObject var model: AppModel
+    @ObservedObject var ai: AssistantModel
+    var onNew: () -> Void
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            Text("欢迎使用 Radar").font(.largeTitle.bold())
+            Text("用一句话说出你关心什么，Radar 持续盯着，只在有新东西时告诉你。").foregroundStyle(.secondary)
+            step("1", "建立第一个关注", "例如：关注 chatgpt、claude、codex 的最新动态", done: false) {
+                Button("新建关注", action: onNew).buttonStyle(.borderedProminent)
+            }
+            step("2", "允许系统通知", "新项目和重大更新会弹通知；其余留在“更新”列表", done: model.notifyStatus == .authorized) {
+                if model.notifyStatus != .authorized {
+                    Button("打开系统通知设置") { NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.Notifications-Settings.extension")!) }
+                }
+            }
+            step("3", "连接本机 Ollama（可选）", "用于 AI 简报和“问 Radar”，只用本机模型。没有它其余功能照常使用", done: ai.status == .ready) {
+                if ai.status != .ready { Link("下载 Ollama", destination: URL(string: "https://ollama.com")!) }
+            }
+            Spacer()
+            Text("Radar \(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "") · 数据只保存在本机").font(.caption).foregroundStyle(.tertiary)
+        }
+        .padding(32).frame(maxWidth: 560, maxHeight: .infinity, alignment: .topLeading).frame(maxWidth: .infinity)
+        .task { await ai.refresh() }
+    }
+    func step<A: View>(_ n: String, _ title: String, _ detail: String, done: Bool, @ViewBuilder action: () -> A) -> some View {
+        HStack(alignment: .top, spacing: 12) {
+            Image(systemName: done ? "checkmark.circle.fill" : "\(n).circle").font(.title2).foregroundStyle(done ? .green : .secondary)
+            VStack(alignment: .leading, spacing: 4) {
+                Text(title).font(.headline)
+                Text(detail).font(.callout).foregroundStyle(.secondary)
+                action().padding(.top, 2)
+            }
         }
     }
 }

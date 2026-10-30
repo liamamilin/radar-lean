@@ -73,7 +73,10 @@ git clone https://github.com/liamamilin/radar-lean.git
 cd radar-lean
 scripts/build_app.sh        # 生成 dist/Radar.app
 open dist/Radar.app
+scripts/make_dmg.sh         # 可选：打成 dist/Radar-0.2.dmg，拖到“应用程序”即可安装
 ```
+
+没有 Apple 开发者账号，所以没有公证：在别的 Mac 上第一次打开要右键 → 打开（或系统设置 → 隐私与安全性 → 仍要打开）。图标由 `swift scripts/make_icon.swift` 生成，放在 `assets/`。
 
 构建产物默认是 ad-hoc 签名；第一次读取钥匙串（如保存了 GitHub Token）时系统会询问，选“始终允许”即可。
 ad-hoc 签名每次重新构建都会变，钥匙串会再问一次；想避免的话，用你自己钥匙串里的代码签名证书构建（先 `security find-identity -v -p codesigning` 查看证书名）：
