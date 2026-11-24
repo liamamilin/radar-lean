@@ -41,13 +41,21 @@ public final class RadarAssistant {
 
     struct Row { var entry: Entry; var source: String; var watch: String; var watchID: Int64 }
 
-    func rows(_ db: Database, watchID: Int64?) throws -> [Row] {
+    /// Candidate entries, newest first. Only the first 2000 characters of the body are read (all that ranking and quoting use), and
+    /// entries older than `since` stay in the database, so a question never pulls the whole archive into memory.
+    func rows(_ db: Database, watchID: Int64?, since: Date? = nil, limit: Int = 4000) throws -> [Row] {
+        var args: [any DatabaseValueConvertible] = []
+        var where_: [String] = []
+        if let watchID { where_.append("ws.watchID = ?"); args.append(watchID) }
+        if let since { where_.append("COALESCE(entry.publishedAt, entry.firstSeenAt) >= ?"); args.append(since) }
         let sql = """
-            SELECT entry.*, source.name AS sourceName, watch.title AS watchTitle, ws.watchID AS wid FROM entry
+            SELECT entry.id, entry.sourceID, entry.externalKey, entry.canonicalURL, entry.title, entry.summary, substr(entry.text, 1, 2000) AS text,
+                   entry.contentHash, entry.firstSeenAt, entry.publishedAt, entry.meta,
+                   source.name AS sourceName, watch.title AS watchTitle, ws.watchID AS wid FROM entry
             JOIN source ON source.id = entry.sourceID JOIN watchSource ws ON ws.sourceID = source.id JOIN watch ON watch.id = ws.watchID
-            \(watchID == nil ? "" : "WHERE ws.watchID = ?") ORDER BY entry.id DESC
+            \(where_.isEmpty ? "" : "WHERE " + where_.joined(separator: " AND ")) ORDER BY entry.id DESC LIMIT \(limit)
             """
-        return try GRDB.Row.fetchAll(db, sql: sql, arguments: watchID.map { [$0] } ?? []).map {
+        return try GRDB.Row.fetchAll(db, sql: sql, arguments: StatementArguments(args)).map {
             Row(entry: try Entry(row: $0), source: $0["sourceName"], watch: $0["watchTitle"], watchID: $0["wid"])
         }
     }
@@ -93,7 +101,7 @@ public final class RadarAssistant {
             for e in evs where seen.insert(e.evidenceURL).inserted {
                 ev.append(evidence(e, entry: try Entry.fetchOne(db, key: e.entryID), watch: titles[e.watchID] ?? "", id: "S\(ev.count + 1)"))
             }
-            var rs = try rows(db, watchID: watchID).filter { r in since.map { Self.date(r.entry) >= $0 } ?? true && seen.insert(r.entry.canonicalURL).inserted }
+            var rs = try rows(db, watchID: watchID, since: since).filter { r in since.map { Self.date(r.entry) >= $0 } ?? true && seen.insert(r.entry.canonicalURL).inserted }
             let total = rs.count
             // worth-a-look first: popular projects and fresh items
             let span = range.days ?? 90
@@ -122,6 +130,16 @@ public final class RadarAssistant {
         if q.contains("一周") || q.contains("7天") || q.contains("7 天") || q.contains("本周") || q.contains("这周") || q.contains("上周") || q.lowercased().contains("past week") { return .week }
         if q.contains("一个月") || q.contains("30天") || q.contains("30 天") || q.contains("本月") { return .month }
         return nil
+    }
+
+    static let overviewFiller = ["最近", "近期", "最新", "过去", "小时", "一周", "本周", "这周", "上周", "今天", "昨天", "一个月", "本月", "天", "有哪些", "有什么", "有啥", "什么", "哪些",
+                                 "发生", "更新", "动态", "新闻", "消息", "资讯", "变化", "新的", "内容", "事情", "帮我", "看看", "请问", "一下", "总结", "汇总", "概括", "都", "有", "了", "的", "吗", "呢", "我", "新", "past", "week", "this", "last", "the", "in", "recent", "recently", "latest", "news", "updates", "update", "what's", "what", "whats", "new"]
+
+    /// "最近 24 小时更新了什么" — asks for everything recent rather than for something named, so keyword matching means nothing.
+    public static func isOverview(_ q: String) -> Bool {
+        var rest = q.lowercased()
+        for w in overviewFiller.sorted(by: { $0.count > $1.count }) { rest = rest.replacingOccurrences(of: w, with: " ") }
+        return !rest.contains { $0.isLetter || ($0.isNumber && !$0.isASCII) } && rest.filter({ $0.isASCII && $0.isLetter }).isEmpty
     }
 
     static func tokens(_ q: String) -> [String] {
@@ -211,9 +229,12 @@ public final class RadarAssistant {
     /// Lexical retrieval over what Radar already stored. `previous` keeps earlier numbering so follow-ups can refer to it.
     public func retrieve(question: String, extraTerms: [String], watchID: Int64?, range: TimeRange?, previous: [Evidence], now: Date = Date(), maxNew: Int = 10) throws -> Retrieval {
         let follow = !previous.isEmpty && Self.followMarkers.contains { question.contains($0) }
-        var toks = Self.tokens(question)
+        let reading = previous.contains { $0.kind == "page" }   // a page the user handed over is in the conversation: follow-ups are about it
+        let overview = !follow && !reading && !Self.isAboutRadar(question) && Self.isOverview(question)
+        let maxNew = overview ? 22 : maxNew
+        var toks = overview ? [] : Self.tokens(question)
         let named = !toks.isEmpty
-        for t in extraTerms where !toks.contains(t) { toks.append(t) }
+        if !overview { for t in extraTerms where !toks.contains(t) { toks.append(t) } }
         let about = Self.isAboutRadar(question)
         let since = (range ?? Self.detectRange(question) ?? .all).since(now)
         return try store.db.read { db -> Retrieval in
@@ -228,10 +249,10 @@ public final class RadarAssistant {
             if let s = since { evq = evq.filter(Column("createdAt") >= s) }
             let evs = try evq.limit(200).fetchAll(db).map { ($0, try Entry.fetchOne(db, key: $0.entryID)) }
                 .map { (e: ($0.0), en: $0.1, s: hits($0.0.title + " " + $0.0.reason + " " + ($0.1?.summary ?? ""))) }
-                .filter { toks.isEmpty || $0.s > 0 }.prefix(follow ? 1 : max(3, maxNew / 3))
+                .filter { toks.isEmpty || $0.s > 0 }.prefix(follow ? 1 : (overview ? 8 : max(3, maxNew / 3)))
             for x in evs where !seen.contains(x.e.evidenceURL) { take(evidence(x.e, entry: x.en, watch: titles[x.e.watchID] ?? "", id: "")) }
             // matching entries, best first
-            let candidates = try rows(db, watchID: watchID).filter { r in since.map { Self.date(r.entry) >= $0 } ?? true }
+            let candidates = try rows(db, watchID: watchID, since: since).filter { r in since.map { Self.date(r.entry) >= $0 } ?? true }
             let scored = candidates.map { r -> (Row, Double, Int) in
                 let e = r.entry
                 let lex = hits(e.title) * 3 + hits(e.summary) * 2 + hits(String(e.text.prefix(2000)))
@@ -242,10 +263,21 @@ public final class RadarAssistant {
             let anyMatch = scored.contains { $0.2 > 0 }
             // a question that names something nothing mentions gets no filler: unrelated items only invite a made-up answer
             let eventHit = out.count > previous.count && out.contains { $0.isEvent }
-            let matched = follow || about || anyMatch || eventHit || !named
-            let ranked = scored.filter { !follow && !anyMatch && matched || $0.2 > 0 }
+            let matched = follow || about || anyMatch || eventHit || !named || reading
+            var ranked = scored.filter { !follow && !anyMatch && matched && !reading || $0.2 > 0 }
+            if overview {   // newest first, one watch at a time in turn, so a busy source cannot crowd out the others
+                var byWatch: [Int64: [(Row, Double, Int)]] = [:], order: [Int64] = []
+                for x in ranked.sorted(by: { Self.date($0.0.entry) > Self.date($1.0.entry) }) {
+                    if byWatch[x.0.watchID] == nil { order.append(x.0.watchID) }
+                    byWatch[x.0.watchID, default: []].append(x)
+                }
+                ranked = []
+                while ranked.count < scored.count, order.contains(where: { !(byWatch[$0] ?? []).isEmpty }) {
+                    for w in order { if let x = byWatch[w]?.first { ranked.append(x); byWatch[w]?.removeFirst() } }
+                }
+            }
             var added = 0
-            for (r, _, _) in ranked where added < (follow ? 3 : maxNew) && out.count < 18 {
+            for (r, _, _) in ranked where added < (follow ? 3 : maxNew) && out.count < (overview ? 30 : 18) {
                 if seen.contains(r.entry.canonicalURL) { continue }
                 take(evidence(r, id: "")); added += 1
             }
@@ -263,14 +295,17 @@ public final class RadarAssistant {
         不要补充资料里没有的评价（例如文档是否完善、社区是否活跃、生态是否开放、是否适合某场景），需要判断时只说资料能支持的部分。\
         如果资料不足以回答，直接说明现有资料掌握了什么、缺什么。回答要简洁：通常不超过 8 条，每条一两句话，不要重复提问，不要附加统计信息。用中文回答，使用 Markdown。
         """
+    static let overviewRule = "\n这是一个概览型问题，资料是按关注事项轮流挑选的近期内容：请尽量覆盖不同的关注事项和来源，按主题分组，最多 15 条，每条一句话，不要只挑少数几条。"
 
     static func block(_ evidence: [Evidence], budget: Int = 12000) -> String {
-        let cap = max(120, min(500, budget / max(1, evidence.count) - 140))
+        let pages = evidence.filter { $0.kind == "page" }.count
+        let pageCap = pages == 0 ? 0 : max(2500, min(7000, 9000 / pages))   // a page the user handed over is read in full, not skimmed
+        let cap = max(120, min(500, (budget - pageCap * pages) / max(1, evidence.count - pages) - 140))
         let f = DateFormatter(); f.dateFormat = "yyyy-MM-dd"
         return evidence.map { e in
-            let head = [e.isEvent ? "事件·\(kindLabel[e.kind] ?? "更新")" : (e.kind == "status" ? "Radar 自身状态" : "已发现内容"), e.date.map { "时间 " + f.string(from: $0) }, "来源 " + e.origin,
-                        e.meta.isEmpty ? nil : e.meta].compactMap { $0 }.joined(separator: " | ")
-            return "[\(e.id)] (\(head))\n标题：\(e.title)\n内容：\(clip(e.text, cap))"
+            let label = e.kind == "page" ? "网页正文（用户提供的链接）" : e.isEvent ? "事件·\(kindLabel[e.kind] ?? "更新")" : (e.kind == "status" ? "Radar 自身状态" : "已发现内容")
+            let head = [label, e.date.map { "时间 " + f.string(from: $0) }, "来源 " + e.origin, e.meta.isEmpty ? nil : e.meta].compactMap { $0 }.joined(separator: " | ")
+            return "[\(e.id)] (\(head))\n标题：\(e.title)\n内容：\(clip(e.text, e.kind == "page" ? pageCap : cap))"
         }.joined(separator: "\n\n")
     }
 
@@ -287,9 +322,39 @@ public final class RadarAssistant {
         return [ChatMessage(role: "system", content: rules + "\n\n资料：\n" + block(ctx.evidence)), ChatMessage(role: "user", content: ask)]
     }
 
+    static let readingRule = """
+
+        资料里有“网页正文”：那是用户提供的链接的内容，请把它当作要阅读的文章，只依据它回答，文中没写的就说“文中未说明”。\
+        如果用户只是给了链接、没有具体问题，按这个结构输出：\
+        ## 一句话结论\
+        ## 要点（5 到 8 条，每条一两句，带 [S编号]）\
+        ## 关键术语（文中出现的专有名词，每个一句解释；没有就省略这一节）\
+        ## 值得追问的问题（3 条，用户可以直接接着问）\
+        用户有具体问题时直接回答，不必套用上面的结构。这时可以比平时更详细。
+        """
+
     public static func askMessages(history: [ChatMessage], question: String, evidence: [Evidence], scope: String) -> [ChatMessage] {
-        let sys = rules + "\n当前检索范围：\(scope)。\n\n资料：\n" + (evidence.isEmpty ? "（没有检索到相关资料）" : block(evidence))
+        let reading = evidence.contains { $0.kind == "page" }
+        let sys = rules + (reading ? readingRule : isOverview(question) ? overviewRule : "") + "\n当前检索范围：\(scope)。\n\n资料：\n" + (evidence.isEmpty ? "（没有检索到相关资料）" : block(evidence))
         return [ChatMessage(role: "system", content: sys)] + history.suffix(8) + [ChatMessage(role: "user", content: question)]
+    }
+
+    // MARK: links handed over in a question
+
+    /// http(s) links in a question, at most three, trailing punctuation removed.
+    public static func urls(in q: String) -> [String] {
+        guard let re = try? NSRegularExpression(pattern: #"https?://[^\s<>"'`，。；、）】」]+"#) else { return [] }
+        var out: [String] = []
+        for m in re.matches(in: q, range: NSRange(q.startIndex..., in: q)) {
+            guard let r = Range(m.range, in: q) else { continue }
+            let u = String(q[r]).trimmingCharacters(in: CharacterSet(charactersIn: ".,;:!?)]}>*"))
+            if !u.isEmpty, !out.contains(u) { out.append(u) }
+        }
+        return Array(out.prefix(3))
+    }
+
+    public static func pageEvidence(_ a: Fetcher.Article, id: String) -> Evidence {
+        Evidence(id: id, title: a.title, url: a.url, origin: URL(string: a.url)?.host ?? "网页", date: nil, text: a.text, meta: "", isEvent: false, kind: "page")
     }
 
     // MARK: citations
@@ -312,6 +377,36 @@ public final class RadarAssistant {
         guard let re = try? NSRegularExpression(pattern: #"S(\d+)"#) else { return [] }
         let ids = Set(re.matches(in: text, range: NSRange(text.startIndex..., in: text)).compactMap { Range($0.range, in: text).map { "S" + String(text[$0].dropFirst()) } })
         return evidence.filter { ids.contains($0.id) }
+    }
+
+    /// Formats one source entry for plain-text copy (title + URL separated cleanly for link auto-detection).
+    public static func formatSourceLine(id: String = "", title: String = "", url: String) -> String {
+        let u = url.trimmingCharacters(in: .whitespacesAndNewlines)
+        let i = id.trimmingCharacters(in: .whitespacesAndNewlines)
+        let t = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !i.isEmpty, !t.isEmpty, t != u, t != i { return "\(i) \(t) — \(u)" }
+        if !t.isEmpty, t != u { return "\(t) — \(u)" }
+        if !i.isEmpty, i != u { return "\(i) — \(u)" }
+        return u
+    }
+
+    /// Appends a deduplicated `来源：` block with titles and URLs for every valid citation referenced in `text`,
+    /// preserving order of first appearance. Returns `text` unchanged when no valid citations appear.
+    public static func textWithLinks(_ text: String, _ evidence: [Evidence]) -> String {
+        guard !evidence.isEmpty,
+              let re = try? NSRegularExpression(pattern: #"(?<![A-Za-z0-9])S(\d+)(?![A-Za-z0-9])"#) else { return text }
+        let byID = Dictionary(evidence.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
+        var lines: [String] = []
+        var seenURLs = Set<String>()
+        for m in re.matches(in: text, range: NSRange(text.startIndex..., in: text)) {
+            guard let r = Range(m.range, in: text) else { continue }
+            let id = String(text[r])
+            guard let ev = byID[id], !ev.url.isEmpty, URL(string: ev.url) != nil,
+                  seenURLs.insert(ev.url).inserted else { continue }
+            lines.append(formatSourceLine(id: ev.id, title: ev.title, url: ev.url))
+        }
+        guard !lines.isEmpty else { return text }
+        return text.trimmingCharacters(in: .whitespacesAndNewlines) + "\n\n来源：\n" + lines.joined(separator: "\n")
     }
 }
 

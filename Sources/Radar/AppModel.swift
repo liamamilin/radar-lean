@@ -12,6 +12,7 @@ enum Keychain {
     static func remember(_ service: String, _ has: Bool) { UserDefaults.standard.set(has, forKey: "keychain." + service) }
     static let service = "app.radar.github-token"
     static let searchService = "app.radar.search-key"
+    static let llmService = "app.radar.llm-key"
     static func get(_ service: String = Keychain.service) -> String? {
         let q: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service,
                                 kSecReturnData as String: true, kSecMatchLimit as String: kSecMatchLimitOne]
@@ -41,6 +42,11 @@ final class AppModel: NSObject, ObservableObject, UNUserNotificationCenterDelega
         didSet { UserDefaults.standard.set(paused, forKey: "paused") }
     }
     @Published var unread = 0
+    let fetcher: Fetcher
+    @Published var askRequest: String?   // a question for 问 Radar from elsewhere in the app (e.g. "read this source")
+    @Published var wantsBriefing = false   // a "briefing ready" notification was clicked
+    let briefing: BriefingModel
+    let proxy = ProxyModel()
     @Published var notifyStatus = UNAuthorizationStatus.notDetermined   // what macOS currently allows us to show
     private let notifyLog = Logger(subsystem: "app.radar", category: "notify")
     @Published var busySources = Set<Int64>()   // sources being read right now (shown in the source rows)
@@ -53,14 +59,17 @@ final class AppModel: NSObject, ObservableObject, UNUserNotificationCenterDelega
     override init() {
         let isolated = ProcessInfo.processInfo.environment["RADAR_DB"] != nil   // a scratch database never touches the real Keychain
         let path = ProcessInfo.processInfo.environment["RADAR_DB"] ?? ((try? Store.defaultPath()) ?? ":memory:")
-        store = try! Store(path: path)
+        store = (try? Store.openOrRecover(path: path)) ?? (try! Store(path: nil))
         let tokenBox = TokenBox()
         let searchBox = TokenBox()
         let fetcher = Fetcher(githubToken: { tokenBox.value }, searchKey: { searchBox.value })
+        self.fetcher = fetcher
         engine = Engine(store: store, fetcher: fetcher)
         discovery = Discovery(fetcher: fetcher, store: store)
         ai = AssistantModel(store: store)
+        briefing = BriefingModel(ai: ai, store: store)
         super.init()
+        briefing.onAutoDone = { [weak self] b in self?.notifyBriefing(b) }
         tokenBox.value = ProcessInfo.processInfo.environment["GITHUB_TOKEN"] ?? (isolated || !Keychain.holds(Keychain.service) ? nil : Keychain.get())
         engine.onChecking = { [weak self] id, on in
             DispatchQueue.main.async { if on { self?.busySources.insert(id) } else { self?.busySources.remove(id) } }
@@ -68,11 +77,12 @@ final class AppModel: NSObject, ObservableObject, UNUserNotificationCenterDelega
         self.tokenBox = tokenBox
         searchBox.value = ProcessInfo.processInfo.environment["EXA_API_KEY"] ?? (isolated || !Keychain.holds(Keychain.searchService) ? nil : Keychain.get(Keychain.searchService))
         self.searchBox = searchBox
+        loadLLMKey()
         observer = DatabaseRegionObservation(tracking: Watch.all(), Source.all(), Event.all(), Entry.all(), WatchSource.all())
             .start(in: store.db, onError: { _ in }, onChange: { [weak self] _ in
                 DispatchQueue.main.async { self?.changed() }
             })
-        changed()
+        refresh()
         UNUserNotificationCenter.current().delegate = self
         // ask once the app is up and active: an early request (inside init) is refused with "not allowed"
         DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
@@ -88,7 +98,7 @@ final class AppModel: NSObject, ObservableObject, UNUserNotificationCenterDelega
             Task { @MainActor in await self?.checkDue() }
         }
         NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
-            Task { @MainActor in await self?.checkDue() }
+            Task { @MainActor in await self?.proxy.refresh(force: true); await self?.checkDue() }
         }
         Task { await checkDue() }
     }
@@ -96,6 +106,15 @@ final class AppModel: NSObject, ObservableObject, UNUserNotificationCenterDelega
     private var searchBox: TokenBox!
     var searchEnabled: Bool { !(searchBox.value ?? "").isEmpty }
     func setSearchKey(_ t: String) { Keychain.set(t, Keychain.searchService); Keychain.remember(Keychain.searchService, !t.isEmpty); searchBox.value = t.isEmpty ? nil : t }
+    func setLLMKey(_ k: String) { Keychain.set(k, ai.keyService); Keychain.remember(ai.keyService, !k.isEmpty); ai.apiKey = k }
+    /// The key of the service the settings point at (each service keeps its own); only read when the user saved one, so no keychain prompt at launch.
+    func loadLLMKey(userInitiated: Bool = false) {
+        guard ProcessInfo.processInfo.environment["RADAR_LLM_KEY"] == nil, !isolated else { return }
+        let s = ai.keyService
+        guard userInitiated || Keychain.holds(s) else { ai.apiKey = ""; return }
+        ai.apiKey = Keychain.get(s) ?? ""
+        if !ai.apiKey.isEmpty { Keychain.remember(s, true) }
+    }
     func setToken(_ t: String) { Keychain.set(t); Keychain.remember(Keychain.service, !t.isEmpty); tokenBox.value = t.isEmpty ? nil : t }
     /// Settings was opened (the user's own action, so a keychain prompt is fine): pick up what is stored there.
     func adopt(token t: String, searchKey k: String) {
@@ -103,16 +122,30 @@ final class AppModel: NSObject, ObservableObject, UNUserNotificationCenterDelega
         if !k.isEmpty { Keychain.remember(Keychain.searchService, true); searchBox.value = k }
     }
 
+    /// The database changed. A sweep writes dozens of times in a second; every view re-reads on `revision`, so bursts are folded into one refresh.
+    private var refreshQueued = false
     func changed() {
-        revision += 1
-        unread = (try? store.db.read { try Event.filter(Column("readAt") == nil).fetchCount($0) }) ?? 0
-        recent = (try? store.db.read { try Event.order(Column("createdAt").desc).limit(5).fetchAll($0) }) ?? []
+        guard !refreshQueued else { return }
+        refreshQueued = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in self?.refreshQueued = false; self?.refresh() }
+    }
+
+    private func refresh() {
+        Task {
+            let r = try? await store.db.read { db in
+                (try Event.filter(Column("readAt") == nil).fetchCount(db), try Event.order(Column("createdAt").desc).limit(5).fetchAll(db))
+            }
+            if let r { unread = r.0; recent = r.1 }
+            revision += 1
+        }
     }
 
     func checkDue(force: Bool = false) async {
+        briefing.runIfDue()
         if paused && !force { return }
         guard !sweeping else { return }            // the previous sweep (timer / wake-up / menu) is still running
         sweeping = true; defer { sweeping = false }
+        await proxy.refresh()                      // decide direct or proxied before anything is fetched
         checking += 1; defer { checking -= 1 }
         notify(await engine.checkDue(force: force))
     }
@@ -143,7 +176,26 @@ final class AppModel: NSObject, ObservableObject, UNUserNotificationCenterDelega
         }
     }
 
+    /// "Read this with Radar": opens 问 Radar and sends the link in a fresh conversation.
+    func readWithRadar(_ url: String) { askRequest = "帮我读一下这篇，整理要点：" + url }
+
+    func notifyBriefing(_ b: Briefing) {
+        let c = UNMutableNotificationContent()
+        c.title = "今日 AI 简报已生成"
+        c.body = "\(b.activeSections.count) 个关注类有更新，共 \(b.updateCount) 条。点击查看。"
+        c.userInfo = ["briefing": true]
+        UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: "briefing-" + b.day, content: c, trigger: nil))
+    }
+
     nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse) async {
+        if response.notification.request.content.userInfo["briefing"] as? Bool == true {
+            await MainActor.run {
+                NSApp.activate(ignoringOtherApps: true)
+                NSApp.windows.first { $0.title == "Radar" }?.makeKeyAndOrderFront(nil)
+                wantsBriefing = true
+            }
+            return
+        }
         if let s = response.notification.request.content.userInfo["url"] as? String, let u = URL(string: s) {
             await MainActor.run { _ = NSWorkspace.shared.open(u) }
         }

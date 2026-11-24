@@ -48,6 +48,8 @@ struct ContentView: View {
                 }.help("立即检查全部来源")
             }
         }
+        .onChange(of: model.askRequest) { _, r in if r != nil { selection = .ask(nil) } }
+        .onChange(of: model.wantsBriefing) { _, w in if w { selection = .briefing; model.wantsBriefing = false } }
         .sheet(isPresented: $showNew) { NewWatchView { id in selection = .watch(id) }.environmentObject(model) }
         .task {
             // Dev aid: RADAR_SNAPSHOT=<dir> writes PNGs of the window (updates view, then first watch) and quits.
@@ -154,6 +156,16 @@ struct EventRow: View {
     static func badge(_ kind: String) -> (String, Color)? {
         switch kind { case "newProject": return ("新项目", .green); case "majorUpdate": return ("重大更新", .orange); case "pageChange": return ("页面变化", .blue); default: return nil }
     }
+    static func copyText(_ e: Event) -> String {
+        var lines = [e.title]
+        if !e.reason.isEmpty { lines.append(e.reason) }
+        var urls: [String] = []
+        if !e.evidenceURL.isEmpty { urls.append(e.evidenceURL) }
+        for ev in e.evidence where !ev.url.isEmpty && !urls.contains(ev.url) { urls.append(ev.url) }
+        if urls.count == 1 { lines.append(urls[0]) }
+        else if urls.count > 1 { lines.append("来源：\n" + urls.joined(separator: "\n")) }
+        return lines.joined(separator: "\n")
+    }
     let event: Event
     var watchTitle: String?
     var body: some View {
@@ -199,7 +211,10 @@ struct UpdatesView: View {
                     EventRow(event: e, watchTitle: titles[e.watchID])
                         .contentShape(Rectangle())
                         .onTapGesture { model.open(e) }
-                        .contextMenu { Button("标为已读") { model.markRead(e) } }
+                        .contextMenu {
+                            Button("复制（含链接）") { Pasteboard.copy(EventRow.copyText(e)) }
+                            Button("标为已读") { model.markRead(e) }
+                        }
                 }
             }
         }
@@ -231,8 +246,11 @@ struct WelcomeView: View {
                     Button("打开系统通知设置") { NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.Notifications-Settings.extension")!) }
                 }
             }
-            step("3", "连接本机 Ollama（可选）", "用于 AI 简报和“问 Radar”，只用本机模型。没有它其余功能照常使用", done: ai.status == .ready) {
-                if ai.status != .ready { Link("下载 Ollama", destination: URL(string: "https://ollama.com")!) }
+            step("3", "连接 AI 模型（可选）", "用于 AI 简报和“问 Radar”：可用本机 Ollama，或在设置里填 OpenCode Go 等服务的 Key。没有它其余功能照常使用", done: ai.status == .ready) {
+                if ai.status != .ready {
+                    SettingsLink { Text("打开设置") }
+                    Link("下载 Ollama", destination: URL(string: "https://ollama.com")!)
+                }
             }
             Spacer()
             Text("Radar \(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "") · 数据只保存在本机").font(.caption).foregroundStyle(.tertiary)

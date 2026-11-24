@@ -48,19 +48,19 @@ actor Throttle {
 public final class Fetcher {
     let searchGate = Throttle()
     public var searchGap: TimeInterval?    // nil = by GitHub's limits; tests set 0
-    public var session: URLSession
+    private var injected: URLSession?
+    /// Tests inject a stub session; otherwise requests go out through the current route (direct, or the local proxy core).
+    public var session: URLSession {
+        get { injected ?? NetworkRoute.shared.session(request: 20, resource: 40) }
+        set { injected = newValue }
+    }
     public var githubToken: () -> String?
     public var searchKey: () -> String?
     public var searchEndpoint = "https://api.exa.ai/search"
     public var githubBase = "https://api.github.com"   // overridable for local end-to-end runs
 
     public init(session: URLSession? = nil, githubToken: @escaping () -> String? = { nil }, searchKey: @escaping () -> String? = { nil }) {
-        if let session { self.session = session } else {
-            let cfg = URLSessionConfiguration.ephemeral
-            cfg.timeoutIntervalForRequest = 20
-            cfg.timeoutIntervalForResource = 40
-            self.session = URLSession(configuration: cfg)
-        }
+        self.injected = session
         self.githubToken = githubToken
         self.searchKey = searchKey
     }
@@ -127,7 +127,7 @@ public final class Fetcher {
     static let iso: ISO8601DateFormatter = { let f = ISO8601DateFormatter(); return f }()
 
     func fetchReleases(_ repo: String, cond: [String: String]) async throws -> FetchResult {
-        let url = URL(string: "\(githubBase)/repos/\(repo)/releases?per_page=30")!
+        guard let url = URL(string: "\(githubBase)/repos/\(repo)/releases?per_page=30") else { throw RadarError.parse("无效的仓库名：\(repo)") }
         let r = try await get(url, headers: githubHeaders().merging(cond) { $1 }, maxBytes: 25_000_000)   // release notes can be huge (openai/codex)
         if r.status == 304 { return FetchResult(entries: [], notModified: true, etag: cond["If-None-Match"], lastModified: cond["If-Modified-Since"]) }
         try check(r, allow304: true)
@@ -346,6 +346,47 @@ public final class Fetcher {
                              summary: String(text.prefix(300)), text: text)
         e.meta = [:]
         return FetchResult(entries: [e], title: title)
+    }
+
+    // MARK: Reading a link the user hands over
+
+    public struct Article { public var title: String; public var url: String; public var text: String }
+
+    /// The readable text of one page. A GitHub repository page reads as its description plus README (the page itself is mostly chrome).
+    public func readArticle(_ urlString: String, maxChars: Int = 12000) async throws -> Article {
+        guard let url = URL(string: urlString) else { throw RadarError.parse("无效地址") }
+        let host = (url.host ?? "").lowercased().replacingOccurrences(of: "www.", with: "")
+        let parts = url.pathComponents.filter { $0 != "/" }
+        let reserved: Set<String> = ["orgs", "topics", "search", "settings", "marketplace", "sponsors", "features", "explore", "trending", "collections"]
+        if host == "github.com", parts.count == 2, !reserved.contains(parts[0]) {
+            return try await readRepo(owner: parts[0], repo: parts[1].replacingOccurrences(of: ".git", with: ""), maxChars: maxChars)
+        }
+        let r = try await get(url, maxBytes: 8_000_000)
+        try check(r, allow304: false)
+        if (r.headers["content-type"] ?? "").lowercased().contains("pdf") { throw RadarError.unsupported("暂不支持 PDF，请先复制正文再贴给我") }
+        let e = try extractPage(html: String(decoding: r.data, as: UTF8.self), url: r.url, selector: nil).entries[0]
+        return Article(title: e.title, url: r.url.absoluteString, text: String(e.text.prefix(maxChars)))
+    }
+
+    func readRepo(owner: String, repo: String, maxChars: Int) async throws -> Article {
+        let base = "\(githubBase)/repos/\(owner)/\(repo)"
+        guard let infoURL = URL(string: base), let readmeURL = URL(string: base + "/readme") else { throw RadarError.parse("无效地址") }
+        let info = try await get(infoURL, headers: githubHeaders())
+        try check(info, allow304: false)
+        let o = (try? JSONSerialization.jsonObject(with: info.data) as? [String: Any]) ?? [:]
+        var head = ["项目：\(owner)/\(repo)"]
+        if let d = o["description"] as? String, !d.isEmpty { head.append("描述：\(d)") }
+        var facts: [String] = []
+        if let n = o["stargazers_count"] as? Int { facts.append("★\(n)") }
+        if let l = o["language"] as? String { facts.append(l) }
+        if let l = (o["license"] as? [String: Any])?["spdx_id"] as? String, l != "NOASSERTION" { facts.append(l) }
+        if let d = o["pushed_at"] as? String { facts.append("最近推送 \(d.prefix(10))") }
+        if !facts.isEmpty { head.append(facts.joined(separator: " · ")) }
+        if let t = o["topics"] as? [String], !t.isEmpty { head.append("主题：" + t.joined(separator: ", ")) }
+        var h = githubHeaders(); h["Accept"] = "application/vnd.github.raw"
+        let readme = (try? await get(readmeURL, headers: h)).flatMap { $0.status == 200 ? String(decoding: $0.data, as: UTF8.self) : nil } ?? ""
+        let text = head.joined(separator: "\n") + (readme.isEmpty ? "\n（没有 README）" : "\n\nREADME：\n" + readme)
+        return Article(title: "\(owner)/\(repo)", url: (o["html_url"] as? String) ?? "https://github.com/\(owner)/\(repo)", text: String(text.prefix(maxChars)))
     }
 
     // MARK: Article / project list pages (no RSS)

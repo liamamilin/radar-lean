@@ -140,10 +140,17 @@ public func sha256(_ s: String) -> String {
 }
 
 public final class Store {
-    public let db: DatabaseQueue
+    /// A file database is a pool (WAL): the UI reads while a check is writing. In memory (tests) it is a single queue.
+    public let db: any DatabaseWriter
 
     public init(path: String?) throws {
-        db = path == nil ? try DatabaseQueue() : try DatabaseQueue(path: path!)
+        if let path {
+            var cfg = Configuration()
+            cfg.busyMode = .timeout(5)
+            db = try DatabasePool(path: path, configuration: cfg)
+        } else {
+            db = try DatabaseQueue()
+        }
         var m = DatabaseMigrator()
         m.registerMigration("v1") { db in
             try db.create(table: "watch") { t in
@@ -230,7 +237,36 @@ public final class Store {
         m.registerMigration("v7") { db in   // list sources now include their selector in the key (js: lists)
             try db.execute(sql: "UPDATE source SET uniqueKey = uniqueKey || '#' || selector WHERE kind = 'list' AND selector IS NOT NULL AND selector <> '' AND uniqueKey NOT LIKE '%#%'")
         }
+        m.registerMigration("v8") { db in   // the daily briefing: an overview plus one section per watch, kept as JSON
+            try db.create(table: "briefing") { t in
+                t.autoIncrementedPrimaryKey("id"); t.column("day", .text).notNull().indexed(); t.column("createdAt", .datetime).notNull(); t.column("json", .blob).notNull()
+            }
+        }
+        m.registerMigration("v9") { db in   // "问 Radar" conversations, turns kept as JSON
+            try db.create(table: "conversation") { t in
+                t.autoIncrementedPrimaryKey("id"); t.column("title", .text).notNull(); t.column("scope", .integer)
+                t.column("createdAt", .datetime).notNull(); t.column("updatedAt", .datetime).notNull().indexed(); t.column("json", .blob).notNull()
+            }
+        }
+        m.registerMigration("v10") { db in   // the lookups the engine and the assistant make on every check / question
+            try db.create(index: "event_watch_merge", on: "event", columns: ["watchID", "mergeKey"])
+            try db.create(index: "event_watch_repo", on: "event", columns: ["watchID", "repoKey", "facet"])
+            try db.create(index: "event_created", on: "event", columns: ["createdAt"])
+            try db.create(index: "event_unread", on: "event", columns: ["readAt"])
+            try db.create(index: "event_entry", on: "event", columns: ["entryID"])
+            try db.create(index: "entry_source_seen", on: "entry", columns: ["sourceID", "firstSeenAt"])
+            try db.create(index: "watchSource_source", on: "watchSource", columns: ["sourceID"])
+        }
         try m.migrate(db)
+    }
+
+    /// Opens the app's database; a file that cannot be opened (damaged, or from a newer build) is moved aside, never deleted, and a fresh one is started.
+    public static func openOrRecover(path: String) throws -> Store {
+        do { return try Store(path: path) } catch {
+            let aside = path + ".unreadable-\(Int(Date().timeIntervalSince1970))"
+            for ext in ["", "-wal", "-shm"] { try? FileManager.default.moveItem(atPath: path + ext, toPath: aside + ext) }
+            return try Store(path: path)
+        }
     }
 
     /// Synchronous read (for non-async callers and tests).

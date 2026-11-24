@@ -110,6 +110,24 @@ Radar 不会自动下载模型，也不需要联网或 Key。Ollama 未运行时
 - AI 请求只发往本机 `127.0.0.1:11434`。云端模型（`*-cloud`）不会出现在模型列表里。
 - 采集只访问你关注的来源；Token / Key 存在系统钥匙串。
 
+## 命令行：让其他程序复用简报
+
+`radar-cli` 只读地输出 Radar 已生成的 AI 简报，不会修改数据库，也不需要 Radar 正在运行。
+
+```bash
+swift build -c release --product radar-cli     # 产物：.build/release/radar-cli
+# scripts/build_app.sh 会同时把它复制到固定路径 dist/radar-cli（其他程序请配置这个路径，不要用 Debug 版）
+radar-cli days                                 # 列出有简报的日期（新的在前）
+radar-cli briefing                             # 最近一份，JSON
+radar-cli briefing --day today                 # 今天；也可写 yyyy-MM-dd
+radar-cli briefing --format markdown           # Markdown，可直接转发或存档
+```
+
+- 找不到简报时退出码为 2；参数错误为 1；读取失败为 3。
+- JSON 字段：`day`、`overview`、`sections[]`（`title`、`text`、`evidence[]`：`id`、`title`、`url`、`origin`、`date`）。
+- `--db <路径>` 指定数据库文件，默认读 `~/Library/Application Support/Radar/radar.sqlite`。
+- 简报由 Radar 里点击或定时生成，CLI 不会触发 AI 生成。
+
 ## 工作方式（给想了解原理的人）
 
 ```

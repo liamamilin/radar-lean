@@ -101,7 +101,11 @@ struct WatchDetailView: View {
                 }
                 Section("事件（\(events.count)）") {
                     if events.isEmpty { Text("尚无事件。首次读取只建立基线，之后的新内容才会产生事件。").foregroundStyle(.secondary) }
-                    ForEach(events) { e in EventRow(event: e).onTapGesture { model.open(e) } }
+                    ForEach(events) { e in
+                        EventRow(event: e)
+                            .onTapGesture { model.open(e) }
+                            .contextMenu { Button("复制（含链接）") { Pasteboard.copy(EventRow.copyText(e)) } }
+                    }
                 }
             } else { ProgressView() }
         }

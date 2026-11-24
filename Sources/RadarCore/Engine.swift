@@ -37,7 +37,7 @@ public final class Engine {
             let result = try await fetcher.fetch(spec, etag: src.initialized ? src.etag : nil, lastModified: src.initialized ? src.lastModified : nil)
             if result.notModified && src.initialized {
                 try await store.db.write { db in
-                    var s = try Source.fetchOne(db, key: sourceID)!
+                    guard var s = try Source.fetchOne(db, key: sourceID) else { return }   // deleted while it was being read
                     s.lastCheckedAt = Date(); s.lastSuccessAt = Date(); s.lastError = nil
                     s.nextDueAt = Date().addingTimeInterval(s.intervalSeconds)
                     try s.update(db)
@@ -48,12 +48,12 @@ public final class Engine {
             return CheckOutcome(newEntries: added, events: events)
         } catch {
             let msg = error.localizedDescription
-            let urlErr = (error as? URLError).map { "网络错误：\($0.localizedDescription)" }
+            let urlErr = (error as? URLError).map { "网络错误：\($0.localizedDescription)" + (NetworkRoute.shared.errorHint ?? "") }
             log.error("check failed \(src.uniqueKey): \(msg)")
-            var due = Date().addingTimeInterval(min(src.intervalSeconds, 30 * 60))
-            if case RadarError.rateLimited(let until) = error { due = until }
+            let due: Date
+            if case RadarError.rateLimited(let until) = error { due = until } else { due = Date().addingTimeInterval(min(src.intervalSeconds, 30 * 60)) }
             try? await store.db.write { db in
-                var s = try Source.fetchOne(db, key: sourceID)!
+                guard var s = try Source.fetchOne(db, key: sourceID) else { return }
                 s.lastCheckedAt = Date(); s.lastError = urlErr ?? msg; s.nextDueAt = due
                 try s.update(db)
             }
@@ -62,7 +62,7 @@ public final class Engine {
     }
 
     func apply(_ result: FetchResult, sourceID: Int64, db: Database) throws -> ([Event], Int) {
-        var src = try Source.fetchOne(db, key: sourceID)!
+        guard var src = try Source.fetchOne(db, key: sourceID) else { return ([], 0) }   // the watch was deleted while this was being read
         let wasInitialized = src.initialized
         var changes: [(Entry, Change)] = []
         var prevVersion: Version?
@@ -309,15 +309,22 @@ public final class Engine {
                 ORDER BY nextDueAt
                 """, arguments: [force, Date()])
         }) ?? []
-        var all: [Event] = []
-        for id in ids { all += await check(sourceID: id).events }
-        return all
+        return await checkAll(ids)
+    }
+
+    /// Up to four sources are read at a time, so one slow site does not hold up the rest. A source that is already being read is skipped.
+    func checkAll(_ ids: [Int64], width: Int = 4) async -> [Event] {
+        await withTaskGroup(of: [Event].self) { group in
+            var all: [Event] = [], next = 0
+            func launch() { if next < ids.count { let id = ids[next]; next += 1; group.addTask { await self.check(sourceID: id).events } } }
+            for _ in 0..<min(width, ids.count) { launch() }
+            while let evs = await group.next() { all += evs; launch() }
+            return all
+        }
     }
 
     public func check(watchID: Int64) async -> [Event] {
         let ids = (try? await store.db.read { try Int64.fetchAll($0, sql: "SELECT sourceID FROM watchSource WHERE watchID = ?", arguments: [watchID]) }) ?? []
-        var all: [Event] = []
-        for id in ids { all += await check(sourceID: id).events }
-        return all
+        return await checkAll(ids)
     }
 }

@@ -1,5 +1,6 @@
 import Foundation
 import WebKit
+import Network
 
 /// Renders a page the way a browser would (JavaScript runs), then hands back the resulting HTML. Used by web / list sources whose
 /// selector starts with "js:". Uses an ephemeral store (no cookies or logins) and does not try to get past human-verification pages.
@@ -9,6 +10,9 @@ enum PageRenderer {
 
     static func render(_ url: URL, timeout: TimeInterval = 25) async throws -> String {
         let cfg = WKWebViewConfiguration(); cfg.websiteDataStore = .nonPersistent()
+        if let p = NetworkRoute.shared.proxyPort, let port = NWEndpoint.Port(rawValue: UInt16(p)) {   // the same route as every other request
+            cfg.websiteDataStore.proxyConfigurations = [ProxyConfiguration(httpCONNECTProxy: .hostPort(host: "127.0.0.1", port: port))]
+        }
         let web = WKWebView(frame: NSRect(x: 0, y: 0, width: 1280, height: 2000), configuration: cfg)
         let loader = Loader(); web.navigationDelegate = loader
         web.load(URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: timeout))

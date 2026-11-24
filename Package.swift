@@ -4,7 +4,7 @@ import PackageDescription
 let package = Package(
     name: "Radar",
     platforms: [.macOS(.v15)],
-    products: [.executable(name: "Radar", targets: ["Radar"])],
+    products: [.executable(name: "Radar", targets: ["Radar"]), .executable(name: "radar-cli", targets: ["RadarCLI"])],
     dependencies: [
         .package(path: "ThirdParty/GRDB.swift"),
         .package(url: "https://github.com/nmdias/FeedKit", from: "9.1.0"),
@@ -16,6 +16,8 @@ let package = Package(
             "FeedKit", "SwiftSoup",
         ], swiftSettings: [.swiftLanguageMode(.v5)]),
         .executableTarget(name: "Radar", dependencies: ["RadarCore"],
+                          swiftSettings: [.swiftLanguageMode(.v5)]),
+        .executableTarget(name: "RadarCLI", dependencies: ["RadarCore"],
                           swiftSettings: [.swiftLanguageMode(.v5)]),
         .testTarget(name: "RadarCoreTests", dependencies: ["RadarCore"],
                     resources: [.copy("fixtures")],

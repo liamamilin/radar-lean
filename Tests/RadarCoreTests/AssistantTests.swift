@@ -155,6 +155,26 @@ final class AssistantTests: Base {
         XCTAssertEqual(RadarAssistant.cited("见 [S2] 和 [S9]", ev).map { $0.id }, ["S2"])
     }
 
+    func testTextWithLinksAppendsCitedSourcesInOrderAndDeduplicates() {
+        let ev = [
+            Evidence(id: "S1", title: "First Report", url: "https://a.test/1", origin: "o", date: nil, text: "", meta: "", isEvent: false, kind: "entry"),
+            Evidence(id: "S2", title: "Second Report", url: "https://b.test/2", origin: "o", date: nil, text: "", meta: "", isEvent: false, kind: "entry"),
+            Evidence(id: "S3", title: "Status Only", url: "", origin: "Radar 状态", date: nil, text: "", meta: "", isEvent: false, kind: "status"),
+        ]
+        let copied = RadarAssistant.textWithLinks("重点 [S2]，还有 【S1、S2】，状态 [S3]，编造 [S9]，忽略 OS1。", ev)
+        XCTAssertEqual(copied, """
+            重点 [S2]，还有 【S1、S2】，状态 [S3]，编造 [S9]，忽略 OS1。
+
+            来源：
+            S2 Second Report — https://b.test/2
+            S1 First Report — https://a.test/1
+            """)
+        XCTAssertEqual(RadarAssistant.textWithLinks("没有引用的文本 OS1", ev), "没有引用的文本 OS1")
+        XCTAssertEqual(RadarAssistant.textWithLinks("仅状态 [S3]", ev), "仅状态 [S3]")
+        XCTAssertEqual(RadarAssistant.formatSourceLine(id: "", title: "Example", url: "https://example.com"), "Example — https://example.com")
+        XCTAssertEqual(RadarAssistant.formatSourceLine(id: "", title: "https://example.com", url: "https://example.com"), "https://example.com")
+    }
+
     func testExportSourcesListsEverySourceWithItsWatches() throws {
         let data = try store.exportSources()
         let o = try JSONSerialization.jsonObject(with: data) as! [String: Any]
@@ -278,6 +298,11 @@ final class OfficialCatalogTests: Base {
         let cands = await disc.findSources(plan: plan, text: "关注 Ollama 的更新")
         let official = cands.filter { $0.official }
         XCTAssertTrue(official.contains { $0.spec.endpoint.contains("ollama.com/blog/rss.xml") && $0.ok })
+    }
+
+    func testBroadQuestionsAreOverviewsButNamedOnesAreNot() {
+        for q in ["最近24小时更新了什么?", "最近 24 小时更新了什么", "帮我看看最近有啥更新?", "本周有哪些新动态", "what's new this week"] { XCTAssertTrue(RadarAssistant.isOverview(q), q) }
+        for q in ["Claude Code 最近更新了什么", "ollama 有什么新版本", "最近有哪些本地模型值得关注", "其中哪个最值得看"] { XCTAssertFalse(RadarAssistant.isOverview(q), q) }
     }
 
     func engineSession() -> URLSession { let c = URLSessionConfiguration.ephemeral; c.protocolClasses = [Stub.self]; return URLSession(configuration: c) }

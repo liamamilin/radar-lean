@@ -3,6 +3,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 swift build -c release
+swift build -c release --product radar-cli   # the command-line reader of saved briefings
 BIN="$(swift build -c release --show-bin-path)/Radar"
 APP=dist/Radar.app
 rm -rf "$APP"; mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
@@ -28,4 +29,5 @@ PL
 for b in "$(dirname "$BIN")"/*.bundle; do case "$b" in *Tests*) ;; *) cp -R "$b" "$APP/Contents/Resources/";; esac; done
 # A stable identity keeps the Keychain "Always Allow" valid across rebuilds; ad-hoc (-) changes it every build.
 codesign --force --deep --sign "${RADAR_SIGN_IDENTITY:--}" "$APP"
-echo "Built $APP"
+cp "$(dirname "$BIN")/radar-cli" dist/radar-cli   # fixed path for other programs: dist/radar-cli
+echo "Built $APP and dist/radar-cli"
