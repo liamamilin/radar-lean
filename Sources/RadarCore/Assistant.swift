@@ -50,7 +50,7 @@ public final class RadarAssistant {
         if let since { where_.append("COALESCE(entry.publishedAt, entry.firstSeenAt) >= ?"); args.append(since) }
         let sql = """
             SELECT entry.id, entry.sourceID, entry.externalKey, entry.canonicalURL, entry.title, entry.summary, substr(entry.text, 1, 2000) AS text,
-                   entry.contentHash, entry.firstSeenAt, entry.publishedAt, entry.meta,
+                   entry.contentHash, entry.firstSeenAt, entry.publishedAt, entry.meta, entry.mergeKey,
                    source.name AS sourceName, watch.title AS watchTitle, ws.watchID AS wid FROM entry
             JOIN source ON source.id = entry.sourceID JOIN watchSource ws ON ws.sourceID = source.id JOIN watch ON watch.id = ws.watchID
             \(where_.isEmpty ? "" : "WHERE " + where_.joined(separator: " AND ")) ORDER BY entry.id DESC LIMIT \(limit)

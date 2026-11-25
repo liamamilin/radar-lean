@@ -10,8 +10,10 @@ final class BriefingModel: ObservableObject {
 
     let ai: AssistantModel
     let briefer: Briefer
-    @Published var days: [Briefing] = []          // newest first, one per day
+    @Published var headers: [BriefingHeader] = [] // newest first, lightweight index
     @Published var watches: [Watch] = []          // the tabs: active watches
+    @Published var today: String = Briefer.dayKey(Date())
+    @Published private var cache: [String: Briefing] = [:]
     @Published var job: Job?
     @Published var progress = ""
     @Published var error: String?
@@ -24,21 +26,40 @@ final class BriefingModel: ObservableObject {
     var onAutoDone: ((Briefing) -> Void)?
     private var lastAttempt: Date?
     private var task: Task<Void, Never>?
+    private var dayObserver: NSObjectProtocol?
     static let retryAfter: TimeInterval = 15 * 60
 
     var running: Bool { job != nil }
-    var today: String { Briefer.dayKey(Date()) }
 
     init(ai: AssistantModel, store: Store) {
         self.ai = ai; briefer = Briefer(store: store)
+        dayObserver = NotificationCenter.default.addObserver(forName: .NSCalendarDayChanged, object: nil, queue: .main) { [weak self] _ in
+            Task { @MainActor in self?.refreshDay() }
+        }
         reload()
     }
 
-    func reload() {
-        days = (try? briefer.days()) ?? []
-        watches = (try? briefer.watches()) ?? []
+    func refreshDay(_ now: Date = Date()) {
+        let k = Briefer.dayKey(now)
+        if today != k { today = k; loadDay(k) }
     }
-    func briefing(_ day: String) -> Briefing? { days.first { $0.day == day } }
+
+    func reload() {
+        refreshDay()
+        headers = (try? briefer.dayHeaders()) ?? []
+        watches = (try? briefer.watches()) ?? []
+        cache.removeAll()
+        loadDay(today)
+    }
+
+    func loadDay(_ day: String) {
+        if let b = briefer.briefing(day: day) { cache[day] = b } else { cache.removeValue(forKey: day) }
+    }
+
+    func briefing(_ day: String) -> Briefing? {
+        if let b = cache[day] { return b }
+        return briefer.briefing(day: day)
+    }
 
     func cancel() { task?.cancel() }
 
@@ -94,6 +115,7 @@ final class BriefingModel: ObservableObject {
 
     /// Called every minute, at launch and after wake.
     func runIfDue(_ now: Date = Date()) {
+        refreshDay(now)
         guard dueNow(now) else { return }
         lastAttempt = now
         start(.all(force: false), auto: true)

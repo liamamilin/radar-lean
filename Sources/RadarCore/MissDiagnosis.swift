@@ -38,12 +38,19 @@ public struct MissDiagnosis {
             f.watch = try Watch.fetchOne(db, key: watchID)
             let links = try WatchSource.filter(Column("watchID") == watchID).fetchAll(db)
             for l in links { if let s = try Source.fetchOne(db, key: l.sourceID) { f.linked.append((s, l.baselineReady)) } }
-            let sources = try Source.fetchAll(db)
-            for s in sources {
-                f.counts[s.id!] = try Entry.filter(Column("sourceID") == s.id!).fetchCount(db)
-                f.firstSeen[s.id!] = try Date.fetchOne(db, sql: "SELECT MIN(firstSeenAt) FROM entry WHERE sourceID = ?", arguments: [s.id!])
-                // the whole table, not the few entries a screen shows
-                for e in try Entry.filter(Column("sourceID") == s.id!).fetchAll(db) where mergeKey(e.canonicalURL) == key { f.entries.append((e, s)) }
+            let sourcesByID = Dictionary(uniqueKeysWithValues: try Source.fetchAll(db).compactMap { s in s.id.map { ($0, s) } })
+            for (s, _) in f.linked {
+                guard let sid = s.id else { continue }
+                f.counts[sid] = try Entry.filter(Column("sourceID") == sid).fetchCount(db)
+                f.firstSeen[sid] = try Date.fetchOne(db, sql: "SELECT MIN(firstSeenAt) FROM entry WHERE sourceID = ?", arguments: [sid])
+            }
+            for e in try Entry.filter(Column("mergeKey") == key).fetchAll(db) {
+                if let s = sourcesByID[e.sourceID] {
+                    f.entries.append((e, s))
+                    if f.firstSeen[e.sourceID] == nil {
+                        f.firstSeen[e.sourceID] = try Date.fetchOne(db, sql: "SELECT MIN(firstSeenAt) FROM entry WHERE sourceID = ?", arguments: [e.sourceID])
+                    }
+                }
             }
             f.events = try Event.filter(Column("watchID") == watchID && Column("mergeKey") == key).fetchAll(db)
             return f

@@ -296,6 +296,7 @@ public final class NetworkRoute: @unchecked Sendable {
         let cfg = URLSessionConfiguration.ephemeral
         cfg.timeoutIntervalForRequest = 6; cfg.timeoutIntervalForResource = 8
         let s = URLSession(configuration: cfg)
+        defer { s.finishTasksAndInvalidate() }
         guard let (_, resp) = try? await s.data(from: URL(string: "https://www.google.com/generate_204")!), let h = resp as? HTTPURLResponse else { return false }
         return (200..<400).contains(h.statusCode)
     }

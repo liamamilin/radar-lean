@@ -184,6 +184,45 @@ final class AssistantTests: Base {
         XCTAssertTrue(list.allSatisfy { ($0["endpoint"] as? String)?.isEmpty == false && $0["kind"] != nil })
         XCTAssertTrue(list.contains { ($0["watches"] as? [String])?.isEmpty == false })
     }
+
+    func testPruneOldEntriesKeepsRecentAndEventReferencedRows() throws {
+        let oldDate = Date().addingTimeInterval(-220 * 86400)
+        var keptOldEventEntry: Entry!
+        try store.db.write { db in
+            var stale = Entry(id: nil, sourceID: sid, externalKey: "stale", canonicalURL: "https://a.test/stale", title: "stale", summary: "", text: "body", contentHash: "1", firstSeenAt: oldDate, publishedAt: oldDate, meta: [:])
+            try stale.insert(db)
+            var withEv = Entry(id: nil, sourceID: sid, externalKey: "with-ev", canonicalURL: "https://a.test/with-ev", title: "with-ev", summary: "", text: "body", contentHash: "2", firstSeenAt: oldDate, publishedAt: oldDate, meta: [:])
+            try withEv.insert(db)
+            keptOldEventEntry = withEv
+            var recent = Entry(id: nil, sourceID: sid, externalKey: "recent", canonicalURL: "https://a.test/recent", title: "recent", summary: "", text: "body", contentHash: "3", firstSeenAt: Date(), publishedAt: Date(), meta: [:])
+            try recent.insert(db)
+        }
+        try event(keptOldEventEntry)
+        let deleted = try store.pruneOldEntries(olderThanDays: 180)
+        XCTAssertEqual(deleted, 1)
+        let remaining = try store.sync { try Entry.fetchAll($0).map(\.externalKey) }
+        XCTAssertEqual(Set(remaining), ["with-ev", "recent"])
+    }
+
+    func testEntryMergeKeyIsIndexedAndUsedByMissDiagnosis() async throws {
+        let e = try entry("tracked-post", "agent notes", days: 1, url: "https://www.example.com/post?utm_source=hn")
+        let storedKey: String? = try store.sync { try String.fetchOne($0, sql: "SELECT mergeKey FROM entry WHERE id = ?", arguments: [e.id!]) }
+        XCTAssertEqual(storedKey, "u:example.com/post")
+        let diag = await MissDiagnosis.diagnose(url: "https://example.com/post/", watchID: wid, store: store, fetcher: Fetcher())
+        XCTAssertTrue(diag.findings.contains { $0.text.contains("Radar 读到过它") })
+    }
+
+    func testOpenSafelyRecoversCorruptDatabaseAndReportsBackup() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("radar-corrupt-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let dbPath = dir.appendingPathComponent("radar.sqlite").path
+        try Data("not a valid sqlite database file".utf8).write(to: URL(fileURLWithPath: dbPath))
+        let res = try Store.openSafely(path: dbPath)
+        XCTAssertNotNil(res.recoveredFrom)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: res.recoveredFrom!))
+        XCTAssertEqual(try res.store.sync { try Watch.fetchCount($0) }, 0)
+    }
 }
 
 final class HackerNewsTests: Base {

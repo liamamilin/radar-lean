@@ -7,8 +7,10 @@ enum Selection: Hashable { case updates, briefing, ask(Int64?), watch(Int64) }
 
 struct ContentView: View {
     @EnvironmentObject var model: AppModel
+    @Environment(\.openWindow) private var openWindow
     @State private var selection: Selection? = .updates
     @State private var watches: [Watch] = []
+    @State private var failedSourceCounts: [Int64: Int] = [:]
     @State private var showNew = false
 
     var body: some View {
@@ -19,8 +21,18 @@ struct ContentView: View {
                 Label("问 Radar", systemImage: "bubble.left.and.text.bubble.right").tag(Selection.ask(nil))
                 Section("关注") {
                     ForEach(watches) { w in
-                        Label(w.title, systemImage: icon(w)).tag(Selection.watch(w.id!))
-                            .foregroundStyle(w.isActive ? .primary : .secondary)
+                        HStack(spacing: 6) {
+                            Label(w.title, systemImage: icon(w))
+                            Spacer(minLength: 4)
+                            if let n = failedSourceCounts[w.id!], n > 0 {
+                                Image(systemName: "exclamationmark.triangle.fill")
+                                    .font(.caption2)
+                                    .foregroundStyle(.orange)
+                                    .help("有 \(n) 个信息源最近读取失败")
+                            }
+                        }
+                        .tag(Selection.watch(w.id!))
+                        .foregroundStyle(w.isActive ? .primary : .secondary)
                     }
                     if watches.isEmpty { Text("还没有关注事项").foregroundStyle(.secondary) }
                 }
@@ -31,13 +43,28 @@ struct ContentView: View {
                     .buttonStyle(.borderedProminent).padding(10)
             }
         } detail: {
-            switch selection {
-            case .watch(let id): WatchDetailView(watchID: id, selection: $selection).id(id)
-            case .briefing: BriefingView()
-            case .ask(let scope): AskRadarView(scope: scope).id(scope)
-            default: UpdatesView(onNew: { showNew = true })
+            VStack(spacing: 0) {
+                if let warn = model.storageWarning {
+                    HStack(spacing: 8) {
+                        Label(warn, systemImage: "exclamationmark.triangle.fill").font(.caption).foregroundStyle(.orange)
+                        Spacer()
+                        Button { model.storageWarning = nil } label: { Image(systemName: "xmark") }.buttonStyle(.borderless).font(.caption)
+                    }
+                    .padding(.horizontal, 14).padding(.vertical, 8)
+                    .background(Color.orange.opacity(0.12))
+                    Divider()
+                }
+                Group {
+                    switch selection {
+                    case .watch(let id): WatchDetailView(watchID: id, selection: $selection).id(id)
+                    case .briefing: BriefingView()
+                    case .ask(let scope): AskRadarView(scope: scope).id(scope)
+                    default: UpdatesView(onNew: { showNew = true })
+                    }
+                }.frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
+        .onAppear { model.openMainWindow = { openWindow(id: "main") } }
         .toolbar {
             ToolbarItem {
                 Button { Self.exportSources(model.store) } label: { Label("导出信息源", systemImage: "square.and.arrow.up") }.help("把所有信息源导出为 JSON 文件")
@@ -55,10 +82,9 @@ struct ContentView: View {
             // Dev aid: RADAR_SNAPSHOT=<dir> writes PNGs of the window (updates view, then first watch) and quits.
             guard let dir = ProcessInfo.processInfo.environment["RADAR_SNAPSHOT"] else { return }
             try? await Task.sleep(nanoseconds: 6_000_000_000)
-            func shot(_ name: String) { Self.snapshot(dir + "/" + name) }
             try? NSApp.windows.map { "\($0.title) \($0.frame) vis=\($0.isVisible) sheet=\($0.isSheet) \(type(of: $0))" }.joined(separator: "\n").write(toFile: dir + "/windows.txt", atomically: true, encoding: .utf8)
-            shot("updates.png")
-            if let w = watches.first?.id { selection = .watch(w); try? await Task.sleep(nanoseconds: 2_000_000_000); shot("watch.png") }
+            Self.snapshot(dir + "/updates.png")
+            if let w = watches.first?.id { selection = .watch(w); try? await Task.sleep(nanoseconds: 2_000_000_000); Self.snapshot(dir + "/watch.png") }
             showNew = true; try? await Task.sleep(nanoseconds: 1_500_000_000)
             if let sheet = NSApp.windows.first(where: { $0.isSheet })?.contentView, let rep = sheet.bitmapImageRepForCachingDisplay(in: sheet.bounds) {
                 sheet.cacheDisplay(in: sheet.bounds, to: rep)
@@ -68,7 +94,22 @@ struct ContentView: View {
         }
         .task { await drive() }
         .task(id: model.revision) {
-            watches = (try? await model.store.db.read { try Watch.order(Column("createdAt").desc).fetchAll($0) }) ?? []
+            let r = try? await model.store.db.read { db -> ([Watch], [Int64: Int]) in
+                let ws = try Watch.order(Column("createdAt").desc).fetchAll(db)
+                let rows = try Row.fetchAll(db, sql: """
+                    SELECT ws.watchID AS wid, COUNT(*) AS cnt
+                    FROM watchSource ws JOIN source s ON s.id = ws.sourceID
+                    WHERE s.lastError IS NOT NULL AND s.lastError <> ''
+                    GROUP BY ws.watchID
+                    """)
+                var counts: [Int64: Int] = [:]
+                for row in rows {
+                    if let wid: Int64 = row["wid"], let c: Int = row["cnt"] { counts[wid] = c }
+                }
+                return (ws, counts)
+            }
+            watches = r?.0 ?? []
+            failedSourceCounts = r?.1 ?? [:]
         }
     }
 
@@ -94,7 +135,7 @@ struct ContentView: View {
     /// create a watch from the sentence, check, pause/resume, fake an incremental update, edit by natural language — with a PNG at each stage.
     func drive() async {
         let env = ProcessInfo.processInfo.environment
-        guard let dir = env["RADAR_DRIVE_DIR"], let text = env["RADAR_DRIVE_TEXT"] else { return }
+        guard let dir = env["RADAR_DRIVE_DIR"], env["RADAR_DRIVE_TEXT"] != nil else { return }
         func log(_ s: String) { print("DRIVE", s); FileHandle.standardError.write(Data(("DRIVE " + s + "\n").utf8)) }
         func settle(_ max: Double = 240) async {
             try? await Task.sleep(nanoseconds: 2_000_000_000)
@@ -199,15 +240,49 @@ struct UpdatesView: View {
     @State private var events: [Event] = []
     @State private var titles: [Int64: String] = [:]
     @State private var loaded = false
+    @State private var query = ""
+    @State private var unreadOnly = false
+    @State private var filterWatchID: Int64?
+    @State private var filterKind: String?
     var onNew: () -> Void = {}
+
+    private var hasFilter: Bool {
+        unreadOnly || filterWatchID != nil || filterKind != nil || !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    private var filteredEvents: [Event] {
+        let q = query.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return events.filter { e in
+            if unreadOnly && e.readAt != nil { return false }
+            if let wid = filterWatchID, e.watchID != wid { return false }
+            if let k = filterKind, e.kind != k { return false }
+            guard !q.isEmpty else { return true }
+            if e.title.lowercased().contains(q) || e.reason.lowercased().contains(q) || e.evidenceURL.lowercased().contains(q) { return true }
+            if let wt = titles[e.watchID], wt.lowercased().contains(q) { return true }
+            return e.evidence.contains { $0.name.lowercased().contains(q) }
+        }
+    }
+
+    private func clearFilters() {
+        query = ""; unreadOnly = false; filterWatchID = nil; filterKind = nil
+    }
+
     var body: some View {
         Group {
             if loaded && titles.isEmpty && events.isEmpty {
                 WelcomeView(ai: model.ai, onNew: onNew)
             } else if events.isEmpty {
                 ContentUnavailableView("暂无更新", systemImage: "bell", description: Text("首次读取只建立基线，之后出现的新内容会显示在这里。"))
+            } else if filteredEvents.isEmpty {
+                ContentUnavailableView {
+                    Label("没有匹配的更新", systemImage: "line.3.horizontal.decrease.circle")
+                } description: {
+                    Text("试试调整关键词或筛选条件。")
+                } actions: {
+                    Button("清除筛选", action: clearFilters)
+                }
             } else {
-                List(events) { e in
+                List(filteredEvents) { e in
                     EventRow(event: e, watchTitle: titles[e.watchID])
                         .contentShape(Rectangle())
                         .onTapGesture { model.open(e) }
@@ -219,7 +294,45 @@ struct UpdatesView: View {
             }
         }
         .navigationTitle("更新")
-        .toolbar { Button("全部已读") { model.markAllRead() }.disabled(model.unread == 0) }
+        .searchable(text: $query, prompt: "搜索标题、摘要或来源")
+        .toolbar {
+            ToolbarItem {
+                Button { unreadOnly.toggle() } label: {
+                    Label("仅未读", systemImage: unreadOnly ? "line.3.horizontal.decrease.circle.fill" : "line.3.horizontal.decrease.circle")
+                }
+                .foregroundStyle(unreadOnly ? Color.accentColor : Color.primary)
+                .help(unreadOnly ? "显示全部更新" : "仅显示未读更新")
+            }
+            ToolbarItem {
+                Menu {
+                    Section("按类型") {
+                        Button((filterKind == nil ? "✓ " : "") + "全部类型") { filterKind = nil }
+                        ForEach([("newProject", "新项目"), ("majorUpdate", "重大更新"), ("pageChange", "页面变化"), ("update", "普通更新")], id: \.0) { k, label in
+                            Button((filterKind == k ? "✓ " : "") + label) { filterKind = k }
+                        }
+                    }
+                    if !titles.isEmpty {
+                        Section("按关注") {
+                            Button((filterWatchID == nil ? "✓ " : "") + "全部关注") { filterWatchID = nil }
+                            ForEach(titles.sorted { $0.value < $1.value }, id: \.key) { id, title in
+                                Button((filterWatchID == id ? "✓ " : "") + title) { filterWatchID = id }
+                            }
+                        }
+                    }
+                    if hasFilter {
+                        Divider()
+                        Button("清除筛选", action: clearFilters)
+                    }
+                } label: {
+                    Label("筛选", systemImage: (filterWatchID != nil || filterKind != nil) ? "slider.horizontal.3" : "slider.horizontal.3")
+                }
+                .foregroundStyle((filterWatchID != nil || filterKind != nil) ? Color.accentColor : Color.primary)
+                .help("按关注事项或事件类型筛选")
+            }
+            ToolbarItem {
+                Button("全部已读") { model.markAllRead() }.disabled(model.unread == 0)
+            }
+        }
         .task(id: model.revision) {
             let r = try? await model.store.db.read { db in (try Event.order(Column("createdAt").desc).limit(300).fetchAll(db), try Watch.fetchAll(db)) }
             events = r?.0 ?? []

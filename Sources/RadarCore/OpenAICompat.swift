@@ -66,8 +66,14 @@ public final class OpenAICompatClient: ChatClient, @unchecked Sendable {
         self.baseURL = baseURL; self.apiKey = apiKey; self.injected = session; self.sessionID = sessionID; self.disableThinking = disableThinking
     }
 
-    func request(_ path: String, timeout: TimeInterval) -> URLRequest {
-        var req = URLRequest(url: URL(string: baseURL.absoluteString.trimmingCharacters(in: CharacterSet(charactersIn: "/")) + "/" + path)!)
+    func request(_ path: String, timeout: TimeInterval) throws -> URLRequest {
+        let root = baseURL.absoluteString.trimmingCharacters(in: .whitespacesAndNewlines).trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        guard let url = URL(string: root + "/" + path),
+              let scheme = url.scheme?.lowercased(), ["http", "https"].contains(scheme),
+              !(url.host ?? "").isEmpty else {
+            throw LLMError.failed("接口地址格式无效：\(baseURL.absoluteString)")
+        }
+        var req = URLRequest(url: url)
         req.timeoutInterval = timeout
         req.setValue("Bearer " + apiKey, forHTTPHeaderField: "Authorization")
         req.setValue("radar-macos/0.3", forHTTPHeaderField: "User-Agent")
@@ -84,8 +90,9 @@ public final class OpenAICompatClient: ChatClient, @unchecked Sendable {
 
     public func models() async throws -> [OllamaModel] {
         guard !apiKey.isEmpty else { throw LLMError.noKey }
+        let req = try request("models", timeout: 15)
         let data: Data, resp: URLResponse
-        do { (data, resp) = try await session.data(for: request("models", timeout: 15)) } catch { throw LLMError.unreachable(baseURL.host ?? baseURL.absoluteString) }
+        do { (data, resp) = try await session.data(for: req) } catch { throw LLMError.unreachable(baseURL.host ?? baseURL.absoluteString) }
         if let s = (resp as? HTTPURLResponse)?.statusCode, s != 200 { throw Self.errorMessage(data, status: s) }
         guard let o = try? JSONSerialization.jsonObject(with: data) as? [String: Any], let list = o["data"] as? [[String: Any]] else { throw LLMError.failed("无法解析模型列表") }
         let ids = list.compactMap { $0["id"] as? String }.filter { !$0.lowercased().contains("embed") }.sorted()
@@ -105,7 +112,7 @@ public final class OpenAICompatClient: ChatClient, @unchecked Sendable {
             let task = Task {
                 do {
                     guard !apiKey.isEmpty else { throw LLMError.noKey }
-                    var req = request("chat/completions", timeout: 600)
+                    var req = try request("chat/completions", timeout: 600)
                     req.httpMethod = "POST"
                     req.setValue("application/json", forHTTPHeaderField: "Content-Type")
                     req.httpBody = try JSONSerialization.data(withJSONObject: Self.body(model: model.name, messages: messages, disableThinking: disableThinking))

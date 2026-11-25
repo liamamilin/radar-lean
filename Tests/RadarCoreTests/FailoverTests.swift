@@ -47,11 +47,12 @@ final class FailoverTests: XCTestCase {
 
     func testRefusedModelFallsBackToTheCheapestOther() async throws {
         let (f, b) = chat(["beam-free": .fail(LLMError.http(429, "limit")), "deepseek-v4.1-flash": .say(["好", "的"])])
-        var switched: [String] = []
-        f.onSwitch = { from, to, why in switched.append("\(from)>\(to):\(why)") }
+        final class Box: @unchecked Sendable { var items: [String] = [] }
+        let switched = Box()
+        f.onSwitch = { from, to, why in switched.items.append("\(from)>\(to):\(why)") }
         let out = try await run(f)
         XCTAssertEqual(out, "好的"); XCTAssertEqual(b.asked, ["beam-free", "deepseek-v4.1-flash"])
-        XCTAssertEqual(switched, ["beam-free>deepseek-v4.1-flash:HTTP 429"])
+        XCTAssertEqual(switched.items, ["beam-free>deepseek-v4.1-flash:HTTP 429"])
     }
 
     func testUnknownModelAndEmptyReplyAlsoSwitch() async throws {

@@ -28,7 +28,7 @@ struct NewWatchView: View {
                         if busy { ProgressView().controlSize(.small); Text("正在分析并试读来源（联网搜索可能需要十几秒）…").font(.caption).foregroundStyle(.secondary) }
                     }
                 }
-                if var p = plan {
+                if let p = plan {
                     Section("计划（可编辑）") {
                         TextField("名称", text: Binding(get: { plan?.title ?? "" }, set: { plan?.title = $0 }))
                         TextField("包含关键词（逗号分隔）", text: $includeText)

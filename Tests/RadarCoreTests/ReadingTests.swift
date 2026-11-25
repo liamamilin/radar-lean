@@ -1,9 +1,28 @@
 import XCTest
+import CoreGraphics
+import CoreText
 @testable import RadarCore
 
 final class ReadingTests: Base {
     func fetcher() -> Fetcher { let c = URLSessionConfiguration.ephemeral; c.protocolClasses = [Stub.self]; return Fetcher(session: URLSession(configuration: c)) }
     override func setUp() async throws { try await super.setUp(); Stub.routes = [:]; Stub.dynamic = nil; Stub.delay = 0 }
+
+    private func makePDF(text: String, title: String) -> Data {
+        let data = NSMutableData()
+        var mediaBox = CGRect(x: 0, y: 0, width: 612, height: 792)
+        let info: [CFString: Any] = [kCGPDFContextTitle: title]
+        guard let consumer = CGDataConsumer(data: data as CFMutableData),
+              let ctx = CGContext(consumer: consumer, mediaBox: &mediaBox, info as CFDictionary) else { return Data() }
+        ctx.beginPDFPage(nil)
+        let attr = NSAttributedString(string: text, attributes: [.font: CTFontCreateWithName("Helvetica" as CFString, 14, nil)])
+        let framesetter = CTFramesetterCreateWithAttributedString(attr)
+        let path = CGPath(rect: CGRect(x: 40, y: 40, width: 532, height: 700), transform: nil)
+        let frame = CTFramesetterCreateFrame(framesetter, CFRange(location: 0, length: 0), path, nil)
+        CTFrameDraw(frame, ctx)
+        ctx.endPDFPage()
+        ctx.closePDF()
+        return data as Data
+    }
 
     func testLinksAreFoundWithoutTrailingPunctuationAndCapped() {
         XCTAssertEqual(RadarAssistant.urls(in: "帮我读读 https://example.com/a?x=1。还有 (https://github.com/o/r), 以及 https://example.com/a?x=1"),
@@ -34,11 +53,26 @@ final class ReadingTests: Base {
         XCTAssertTrue(a.text.contains("描述：Local runner")); XCTAssertTrue(a.text.contains("★120")); XCTAssertTrue(a.text.contains("Runs models locally."))
     }
 
-    func testPdfAndFailuresAreReportedNotInvented() async {
+    func testPdfAndFailuresAreReportedNotInvented() async throws {
+        let validPDF = makePDF(text: "International AI Safety Report 2026 summarizes capability progress and systemic risk mitigation across frontier models.", title: "AI Safety Report 2026")
+        Stub.routes["https://x.example/report.pdf"] = .init(headers: ["Content-Type": "application/pdf"], body: validPDF)
+        let pdfArt = try await fetcher().readArticle("https://x.example/report.pdf")
+        XCTAssertEqual(pdfArt.title, "AI Safety Report 2026")
+        XCTAssertTrue(pdfArt.text.contains("International AI Safety Report 2026"))
+
         Stub.routes["https://x.example/paper.pdf"] = .init(headers: ["Content-Type": "application/pdf"], body: Data("%PDF".utf8))
         do { _ = try await fetcher().readArticle("https://x.example/paper.pdf"); XCTFail() } catch { XCTAssertTrue(error.localizedDescription.contains("PDF")) }
         Stub.routes["https://x.example/gone"] = .init(status: 404)
         do { _ = try await fetcher().readArticle("https://x.example/gone"); XCTFail() } catch {}
+    }
+
+    func testJsRenderedFallbackInReadArticle() async throws {
+        Stub.routes["https://spa.example/post"] = .init(headers: ["Content-Type": "text/html"], body: Data("<html><body><div id='root'></div></body></html>".utf8))
+        let f = fetcher()
+        f.jsRenderer = { _ in "<html><head><title>SPA Post</title></head><body><article>Rendered dynamically with JavaScript and contains full article text for Radar.</article></body></html>" }
+        let a = try await f.readArticle("https://spa.example/post")
+        XCTAssertEqual(a.title, "SPA Post")
+        XCTAssertTrue(a.text.contains("Rendered dynamically with JavaScript"))
     }
 
     func testAPageIsReadInFullAndPutsTheModelInReadingMode() {

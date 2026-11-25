@@ -50,6 +50,17 @@ public struct Briefing: Codable, Hashable, Identifiable {
     }
 }
 
+/// Lightweight briefing index entry for date navigation without decoding full briefing JSON blobs.
+public struct BriefingHeader: Codable, Hashable, Identifiable {
+    public var day: String
+    public var createdAt: Date
+    public var auto: Bool
+    public var id: String { day }
+    public init(day: String, createdAt: Date, auto: Bool) {
+        self.day = day; self.createdAt = createdAt; self.auto = auto
+    }
+}
+
 /// Builds and stores briefings. Only organises what Radar already collected; it never searches.
 public final class Briefer {
     let store: Store
@@ -88,17 +99,47 @@ public final class Briefer {
         }
     }
 
-    public func briefing(day: String) -> Briefing? { (try? days())?.first { $0.day == day } }
-    public func has(day: String) -> Bool { briefing(day: day) != nil }
+    /// Lightweight index of saved briefing days, newest first, without decoding full JSON payloads.
+    public func dayHeaders() throws -> [BriefingHeader] {
+        try store.db.read { db in
+            var seen = Set<String>()
+            return try Row.fetchAll(db, sql: """
+                SELECT day, createdAt, COALESCE(json_extract(CAST(json AS TEXT), '$.auto'), 0) AS auto
+                FROM briefing ORDER BY day DESC, createdAt DESC, id DESC LIMIT 400
+                """).compactMap { r in
+                guard let day: String = r["day"], let createdAt: Date = r["createdAt"], seen.insert(day).inserted else { return nil }
+                let autoVal: Int = r["auto"] ?? 0
+                return BriefingHeader(day: day, createdAt: createdAt, auto: autoVal != 0)
+            }
+        }
+    }
 
-    /// Inserts the day's briefing, or replaces it in place.
+    public func briefing(day: String) -> Briefing? {
+        try? store.db.read { db in
+            guard let d: Data = try Data.fetchOne(db, sql: "SELECT json FROM briefing WHERE day = ? ORDER BY createdAt DESC, id DESC LIMIT 1", arguments: [day]),
+                  let b = try? Self.decoder.decode(Briefing.self, from: d) else { return nil }
+            return Self.upgraded(b)
+        }
+    }
+    public func has(day: String) -> Bool {
+        (try? store.db.read { try Int.fetchOne($0, sql: "SELECT 1 FROM briefing WHERE day = ? LIMIT 1", arguments: [day]) != nil }) ?? false
+    }
+
+    /// Inserts the day's briefing, or replaces it in place. Strips redundant long `evidence.text` before storage
+    /// (display, links and copy-with-links only need id/title/url/origin/date).
     public func save(_ b: Briefing) throws {
-        let data = try Self.encoder.encode(b)
+        var compact = b
+        for i in compact.sections.indices {
+            for j in compact.sections[i].evidence.indices {
+                compact.sections[i].evidence[j].text = ""
+            }
+        }
+        let data = try Self.encoder.encode(compact)
         try store.db.write { db in
-            if let id = try Int64.fetchOne(db, sql: "SELECT id FROM briefing WHERE day = ? ORDER BY createdAt DESC, id DESC LIMIT 1", arguments: [b.day]) {
-                try db.execute(sql: "UPDATE briefing SET json = ?, createdAt = ? WHERE id = ?", arguments: [data, b.createdAt, id])
+            if let id = try Int64.fetchOne(db, sql: "SELECT id FROM briefing WHERE day = ? ORDER BY createdAt DESC, id DESC LIMIT 1", arguments: [compact.day]) {
+                try db.execute(sql: "UPDATE briefing SET json = ?, createdAt = ? WHERE id = ?", arguments: [data, compact.createdAt, id])
             } else {
-                try db.execute(sql: "INSERT INTO briefing (day, createdAt, json) VALUES (?, ?, ?)", arguments: [b.day, b.createdAt, data])
+                try db.execute(sql: "INSERT INTO briefing (day, createdAt, json) VALUES (?, ?, ?)", arguments: [compact.day, compact.createdAt, data])
             }
         }
     }

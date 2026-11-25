@@ -104,7 +104,11 @@ public struct Entry: Codable, FetchableRecord, MutablePersistableRecord, Identif
     public var firstSeenAt: Date
     public var publishedAt: Date?
     public var meta: [String: String]
+    public var mergeKey: String = ""
     public static let databaseTableName = "entry"
+    public mutating func willInsert(_ db: Database) throws {
+        if mergeKey.isEmpty && !canonicalURL.isEmpty { mergeKey = RadarCore.mergeKey(canonicalURL) }
+    }
     public mutating func didInsert(_ inserted: InsertionSuccess) { id = inserted.rowID }
 }
 
@@ -257,16 +261,47 @@ public final class Store {
             try db.create(index: "entry_source_seen", on: "entry", columns: ["sourceID", "firstSeenAt"])
             try db.create(index: "watchSource_source", on: "watchSource", columns: ["sourceID"])
         }
+        m.registerMigration("v11") { db in   // indexed mergeKey on entry so MissDiagnosis never scans full texts into memory
+            try db.alter(table: "entry") { t in
+                t.add(column: "mergeKey", .text).notNull().defaults(to: "")
+            }
+            let rows = try Row.fetchAll(db, sql: "SELECT id, canonicalURL FROM entry")
+            for r in rows {
+                if let id: Int64 = r["id"], let url: String = r["canonicalURL"] {
+                    try db.execute(sql: "UPDATE entry SET mergeKey = ? WHERE id = ?", arguments: [mergeKey(url), id])
+                }
+            }
+            try db.create(index: "entry_mergeKey", on: "entry", columns: ["mergeKey"])
+        }
         try m.migrate(db)
     }
 
-    /// Opens the app's database; a file that cannot be opened (damaged, or from a newer build) is moved aside, never deleted, and a fresh one is started.
-    public static func openOrRecover(path: String) throws -> Store {
-        do { return try Store(path: path) } catch {
+    public struct OpenResult {
+        public var store: Store
+        public var recoveredFrom: String?
+    }
+
+    /// Opens the app's database. Only when the file is genuinely corrupt or from an incompatible schema is it moved aside
+    /// (never deleted) and replaced with a fresh database; transient errors (busy, locked, disk full, permission) are rethrown
+    /// so a healthy database is never silently replaced.
+    public static func openSafely(path: String) throws -> OpenResult {
+        do { return OpenResult(store: try Store(path: path), recoveredFrom: nil) } catch {
+            guard isCorruptionOrSchemaError(error) else { throw error }
             let aside = path + ".unreadable-\(Int(Date().timeIntervalSince1970))"
             for ext in ["", "-wal", "-shm"] { try? FileManager.default.moveItem(atPath: path + ext, toPath: aside + ext) }
-            return try Store(path: path)
+            return OpenResult(store: try Store(path: path), recoveredFrom: aside)
         }
+    }
+
+    public static func openOrRecover(path: String) throws -> Store {
+        try openSafely(path: path).store
+    }
+
+    static func isCorruptionOrSchemaError(_ error: Error) -> Bool {
+        if let dbErr = error as? DatabaseError {
+            return [ResultCode.SQLITE_CORRUPT, .SQLITE_NOTADB, .SQLITE_FORMAT, .SQLITE_SCHEMA].contains(dbErr.resultCode)
+        }
+        return false
     }
 
     /// Synchronous read (for non-async callers and tests).
@@ -320,6 +355,21 @@ public final class Store {
             _ = try Watch.deleteOne(db, key: id)
             // drop sources nobody uses
             try db.execute(sql: "DELETE FROM source WHERE id NOT IN (SELECT sourceID FROM watchSource)")
+        }
+    }
+
+    /// Removes entries older than `olderThanDays` that have no associated event, keeping SQLite size bounded over time.
+    @discardableResult
+    public func pruneOldEntries(olderThanDays: Int = 180, now: Date = Date()) throws -> Int {
+        let cutoff = now.addingTimeInterval(-Double(olderThanDays) * 86400)
+        return try db.write { db in
+            try db.execute(sql: """
+                DELETE FROM entry
+                WHERE firstSeenAt < ?
+                  AND COALESCE(publishedAt, firstSeenAt) < ?
+                  AND NOT EXISTS (SELECT 1 FROM event WHERE event.entryID = entry.id)
+                """, arguments: [cutoff, cutoff])
+            return db.changesCount
         }
     }
 }

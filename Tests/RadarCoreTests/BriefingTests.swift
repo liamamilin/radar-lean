@@ -106,4 +106,25 @@ final class BriefingTests: Base {
     func testStripCitationsHandlesGroupsAndFullWidthBrackets() {
         XCTAssertEqual(Briefer.stripCitations("好 [S1] 和 [S2, S3] 以及【S4】。"), "好 和 以及。")
     }
+
+    func testDayHeadersAndCompactBriefingSave() async throws {
+        let br = Briefer(store: store)
+        let m = OllamaModel(name: "fake", thinking: false)
+        let twoDaysAgo = Date().addingTimeInterval(-86400 * 2)
+        try br.save(try await br.generate(client: FakeChat(), model: m, now: twoDaysAgo, auto: true))
+        try br.save(try await br.generate(client: FakeChat(), model: m, auto: false))
+
+        let headers = try br.dayHeaders()
+        XCTAssertEqual(headers.count, 2)
+        XCTAssertEqual(headers[0].day, Briefer.dayKey(Date()))
+        XCTAssertEqual(headers[0].auto, false)
+        XCTAssertEqual(headers[1].day, Briefer.dayKey(twoDaysAgo))
+        XCTAssertEqual(headers[1].auto, true)
+
+        let loaded = try XCTUnwrap(br.briefing(day: Briefer.dayKey(Date())))
+        let firstEv = try XCTUnwrap(loaded.sections.first(where: { !$0.evidence.isEmpty })?.evidence.first)
+        XCTAssertEqual(firstEv.title, "agent-kit")
+        XCTAssertEqual(firstEv.url, "https://github.com/x/agent-kit")
+        XCTAssertEqual(firstEv.text, "")   // redundant body text is stripped on save
+    }
 }

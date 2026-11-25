@@ -45,6 +45,8 @@ final class AppModel: NSObject, ObservableObject, UNUserNotificationCenterDelega
     let fetcher: Fetcher
     @Published var askRequest: String?   // a question for 问 Radar from elsewhere in the app (e.g. "read this source")
     @Published var wantsBriefing = false   // a "briefing ready" notification was clicked
+    @Published var storageWarning: String?
+    var openMainWindow: (() -> Void)?
     let briefing: BriefingModel
     let proxy = ProxyModel()
     @Published var notifyStatus = UNAuthorizationStatus.notDetermined   // what macOS currently allows us to show
@@ -59,7 +61,18 @@ final class AppModel: NSObject, ObservableObject, UNUserNotificationCenterDelega
     override init() {
         let isolated = ProcessInfo.processInfo.environment["RADAR_DB"] != nil   // a scratch database never touches the real Keychain
         let path = ProcessInfo.processInfo.environment["RADAR_DB"] ?? ((try? Store.defaultPath()) ?? ":memory:")
-        store = (try? Store.openOrRecover(path: path)) ?? (try! Store(path: nil))
+        var warning: String?
+        do {
+            let opened = try Store.openSafely(path: path)
+            store = opened.store
+            if let backup = opened.recoveredFrom {
+                warning = "原数据库无法读取，已自动备份到 \(URL(fileURLWithPath: backup).lastPathComponent) 并创建新库。"
+            }
+        } catch {
+            store = try! Store(path: nil)
+            warning = "无法打开本地数据库（\(error.localizedDescription)），当前已临时切换为内存模式，重启后改动不会保存。"
+        }
+        storageWarning = warning
         let tokenBox = TokenBox()
         let searchBox = TokenBox()
         let fetcher = Fetcher(githubToken: { tokenBox.value }, searchKey: { searchBox.value })
@@ -100,7 +113,20 @@ final class AppModel: NSObject, ObservableObject, UNUserNotificationCenterDelega
         NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
             Task { @MainActor in await self?.proxy.refresh(force: true); await self?.checkDue() }
         }
-        Task { await checkDue() }
+        Task {
+            await checkDue()
+            pruneIfNeeded()
+        }
+    }
+
+    /// Runs once per calendar day to drop stale unreferenced entries so the SQLite file stays bounded.
+    private func pruneIfNeeded() {
+        guard !isolated else { return }
+        let today = Briefer.dayKey(Date())
+        guard UserDefaults.standard.string(forKey: "lastPruneDay") != today else { return }
+        UserDefaults.standard.set(today, forKey: "lastPruneDay")
+        let s = store
+        Task.detached(priority: .background) { _ = try? s.pruneOldEntries() }
     }
     private var tokenBox: TokenBox!
     private var searchBox: TokenBox!
@@ -169,9 +195,10 @@ final class AppModel: NSObject, ObservableObject, UNUserNotificationCenterDelega
         for e in events {
             guard let plan = watches.first(where: { $0.id == e.watchID })?.plan, Engine.shouldNotify(plan: plan, kind: e.kind) else { continue }
             let c = UNMutableNotificationContent()
-            c.title = e.title; c.body = e.reason; c.userInfo = ["url": e.evidenceURL]
+            let kind = e.kind, title = e.title
+            c.title = title; c.body = e.reason; c.userInfo = ["url": e.evidenceURL]
             UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: e.dedupeKey, content: c, trigger: nil)) { [notifyLog] error in
-                notifyLog.notice("submitted \(e.kind) '\(e.title)' error=\(String(describing: error), privacy: .public)")
+                notifyLog.notice("submitted \(kind) '\(title)' error=\(String(describing: error), privacy: .public)")
             }
         }
     }
@@ -191,19 +218,23 @@ final class AppModel: NSObject, ObservableObject, UNUserNotificationCenterDelega
         if response.notification.request.content.userInfo["briefing"] as? Bool == true {
             await MainActor.run {
                 NSApp.activate(ignoringOtherApps: true)
-                NSApp.windows.first { $0.title == "Radar" }?.makeKeyAndOrderFront(nil)
+                if let win = NSApp.windows.first(where: { $0.title == "Radar" && $0.canBecomeMain }) {
+                    win.makeKeyAndOrderFront(nil)
+                } else {
+                    openMainWindow?()
+                }
                 wantsBriefing = true
             }
             return
         }
         if let s = response.notification.request.content.userInfo["url"] as? String, let u = URL(string: s) {
-            await MainActor.run { _ = NSWorkspace.shared.open(u) }
+            await MainActor.run { LinkOpener.open(u) }
         }
     }
     nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent n: UNNotification) async -> UNNotificationPresentationOptions { [.banner, .sound] }
 
     func open(_ e: Event) {
-        if let u = URL(string: e.evidenceURL) { NSWorkspace.shared.open(u) }
+        if let u = URL(string: e.evidenceURL) { LinkOpener.open(u) }
         markRead(e)
     }
     func markRead(_ e: Event) {
@@ -222,4 +253,11 @@ final class AppModel: NSObject, ObservableObject, UNUserNotificationCenterDelega
     func delete(_ w: Watch) { try? store.deleteWatch(w.id!) }
 }
 
-final class TokenBox { var value: String? }
+final class TokenBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var _value: String?
+    var value: String? {
+        get { lock.withLock { _value } }
+        set { lock.withLock { _value = newValue } }
+    }
+}

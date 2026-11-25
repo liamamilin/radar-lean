@@ -15,6 +15,7 @@ enum PageRenderer {
         }
         let web = WKWebView(frame: NSRect(x: 0, y: 0, width: 1280, height: 2000), configuration: cfg)
         let loader = Loader(); web.navigationDelegate = loader
+        defer { web.stopLoading(); web.navigationDelegate = nil }
         web.load(URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: timeout))
         let deadline = Date().addingTimeInterval(timeout)
         try await loader.waitForLoad(until: deadline)
@@ -33,17 +34,49 @@ enum PageRenderer {
         return html
     }
 
+    @MainActor
     private final class Loader: NSObject, WKNavigationDelegate {
         private var cont: CheckedContinuation<Void, Error>?
         private var done = false
+        private var resultError: Error?
+
         func waitForLoad(until deadline: Date) async throws {
             try await withThrowingTaskGroup(of: Void.self) { g in
-                g.addTask { @MainActor in try await withCheckedThrowingContinuation { (c: CheckedContinuation<Void, Error>) in self.cont = c; if self.done { self.finish(nil) } } }
-                g.addTask { try await Task.sleep(nanoseconds: UInt64(max(1, deadline.timeIntervalSinceNow) * 1e9)); throw RadarError.unsupported("页面渲染超时") }
-                _ = try await g.next(); g.cancelAll()
+                g.addTask { @MainActor in
+                    try await withTaskCancellationHandler {
+                        try await withCheckedThrowingContinuation { (c: CheckedContinuation<Void, Error>) in
+                            if Task.isCancelled { c.resume(throwing: CancellationError()); return }
+                            if self.done {
+                                if let e = self.resultError { c.resume(throwing: e) } else { c.resume() }
+                                return
+                            }
+                            self.cont = c
+                        }
+                    } onCancel: {
+                        Task { @MainActor in self.finish(CancellationError()) }
+                    }
+                }
+                g.addTask {
+                    try await Task.sleep(nanoseconds: UInt64(max(1, deadline.timeIntervalSinceNow) * 1e9))
+                    throw RadarError.unsupported("页面渲染超时")
+                }
+                do {
+                    _ = try await g.next()
+                    g.cancelAll()
+                } catch {
+                    g.cancelAll()
+                    throw error
+                }
             }
         }
-        private func finish(_ e: Error?) { done = true; if let c = cont { cont = nil; if let e { c.resume(throwing: e) } else { c.resume() } } }
+
+        private func finish(_ e: Error?) {
+            if !done { done = true; resultError = e }
+            if let c = cont {
+                cont = nil
+                if let e { c.resume(throwing: e) } else { c.resume() }
+            }
+        }
         func webView(_ w: WKWebView, didFinish n: WKNavigation!) { finish(nil) }
         func webView(_ w: WKWebView, didFail n: WKNavigation!, withError e: Error) { finish(RadarError.parse("页面加载失败：" + e.localizedDescription)) }
         func webView(_ w: WKWebView, didFailProvisionalNavigation n: WKNavigation!, withError e: Error) { finish(RadarError.parse("页面加载失败：" + e.localizedDescription)) }

@@ -114,7 +114,8 @@ final class ScenarioTests: XCTestCase {
         let before = try store.sync { try Source.fetchCount($0) }
         plan = try XCTUnwrap(PlanParser.applyEdit("也关注 MCP，排除 RAG", to: plan))
         XCTAssertTrue(plan.include.contains("MCP")); XCTAssertEqual(plan.exclude, ["RAG"])
-        try await store.db.write { var wr = try Watch.fetchOne($0, key: w.id!)!; wr.plan = plan; try wr.update($0) }
+        let updatedPlan = plan
+        try await store.db.write { var wr = try Watch.fetchOne($0, key: w.id!)!; wr.plan = updatedPlan; try wr.update($0) }
         let r = await disc.rediscover(watchID: w.id!, plan: plan, text: text)
         print("SCENARIO added:", r.added.map { $0.spec.name }, "stale:", r.stale)
         XCTAssertGreaterThan(try store.sync { try Source.fetchCount($0) }, before - 1)

@@ -1,4 +1,5 @@
 import Foundation
+import PDFKit
 import SwiftSoup
 import FeedKit
 
@@ -58,6 +59,8 @@ public final class Fetcher {
     public var searchKey: () -> String?
     public var searchEndpoint = "https://api.exa.ai/search"
     public var githubBase = "https://api.github.com"   // overridable for local end-to-end runs
+    /// Overridable JS renderer hook for tests; defaults to `PageRenderer.render` when no stub URLSession is injected.
+    public var jsRenderer: (@Sendable (URL) async throws -> String)?
 
     public init(session: URLSession? = nil, githubToken: @escaping () -> String? = { nil }, searchKey: @escaping () -> String? = { nil }) {
         self.injected = session
@@ -124,7 +127,8 @@ public final class Fetcher {
 
     // MARK: GitHub
 
-    static let iso: ISO8601DateFormatter = { let f = ISO8601DateFormatter(); return f }()
+    // Fresh formatter per call: ISO8601DateFormatter is not thread-safe under concurrent Engine.checkAll tasks.
+    static var iso: ISO8601DateFormatter { ISO8601DateFormatter() }
 
     func fetchReleases(_ repo: String, cond: [String: String]) async throws -> FetchResult {
         guard let url = URL(string: "\(githubBase)/repos/\(repo)/releases?per_page=30") else { throw RadarError.parse("无效的仓库名：\(repo)") }
@@ -352,7 +356,8 @@ public final class Fetcher {
 
     public struct Article { public var title: String; public var url: String; public var text: String }
 
-    /// The readable text of one page. A GitHub repository page reads as its description plus README (the page itself is mostly chrome).
+    /// The readable text of one page or PDF. A GitHub repository page reads as its description plus README (the page itself is mostly chrome).
+    /// Static HTML pages with too little text automatically fall back to JS rendering (without bypassing human verification).
     public func readArticle(_ urlString: String, maxChars: Int = 12000) async throws -> Article {
         guard let url = URL(string: urlString) else { throw RadarError.parse("无效地址") }
         let host = (url.host ?? "").lowercased().replacingOccurrences(of: "www.", with: "")
@@ -361,11 +366,49 @@ public final class Fetcher {
         if host == "github.com", parts.count == 2, !reserved.contains(parts[0]) {
             return try await readRepo(owner: parts[0], repo: parts[1].replacingOccurrences(of: ".git", with: ""), maxChars: maxChars)
         }
-        let r = try await get(url, maxBytes: 8_000_000)
+        let r = try await get(url, maxBytes: 20_000_000)
         try check(r, allow304: false)
-        if (r.headers["content-type"] ?? "").lowercased().contains("pdf") { throw RadarError.unsupported("暂不支持 PDF，请先复制正文再贴给我") }
-        let e = try extractPage(html: String(decoding: r.data, as: UTF8.self), url: r.url, selector: nil).entries[0]
-        return Article(title: e.title, url: r.url.absoluteString, text: String(e.text.prefix(maxChars)))
+        let contentType = (r.headers["content-type"] ?? "").lowercased()
+        let looksLikePDF = contentType.contains("pdf") || r.url.pathExtension.lowercased() == "pdf" || r.data.starts(with: Data("%PDF".utf8))
+        if looksLikePDF {
+            return try extractPDF(data: r.data, url: r.url, maxChars: maxChars)
+        }
+        do {
+            let e = try extractPage(html: String(decoding: r.data, as: UTF8.self), url: r.url, selector: nil).entries[0]
+            return Article(title: e.title, url: r.url.absoluteString, text: String(e.text.prefix(maxChars)))
+        } catch RadarError.unsupported(let reason) {
+            guard jsRenderer != nil || injected == nil else { throw RadarError.unsupported(reason) }
+            let rendered: String
+            if let custom = jsRenderer { rendered = try await custom(r.url) }
+            else { rendered = try await PageRenderer.render(r.url) }
+            let e = try extractPage(html: rendered, url: r.url, selector: nil).entries[0]
+            return Article(title: e.title, url: r.url.absoluteString, text: String(e.text.prefix(maxChars)))
+        }
+    }
+
+    public func extractPDF(data: Data, url: URL, maxChars: Int = 12000) throws -> Article {
+        guard let doc = PDFDocument(data: data), doc.pageCount > 0 else {
+            throw RadarError.unsupported("无法解析这份 PDF（文件可能损坏或需要登录），请先复制正文再贴给我")
+        }
+        var chunks: [String] = []
+        var total = 0
+        for i in 0..<doc.pageCount {
+            if let pageText = doc.page(at: i)?.string {
+                let clean = pageText.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
+                if !clean.isEmpty {
+                    chunks.append(clean)
+                    total += clean.count
+                    if total >= maxChars { break }
+                }
+            }
+        }
+        let body = chunks.joined(separator: "\n\n")
+        guard body.count >= 20 else {
+            throw RadarError.unsupported("PDF 中未提取到可选中文本（可能是扫描版），请先复制正文再贴给我")
+        }
+        let metaTitle = (doc.documentAttributes?[PDFDocumentAttribute.titleAttribute] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let fallback = url.lastPathComponent.isEmpty ? (url.host ?? "PDF 文档") : url.lastPathComponent
+        return Article(title: (metaTitle?.isEmpty == false ? metaTitle! : fallback), url: url.absoluteString, text: String(body.prefix(maxChars)))
     }
 
     func readRepo(owner: String, repo: String, maxChars: Int) async throws -> Article {

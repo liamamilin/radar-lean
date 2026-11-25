@@ -42,4 +42,12 @@ final class OpenAICompatTests: XCTestCase {
         do { for try await _ in client().chat(model: OllamaModel(name: "x", thinking: false), messages: []) {}; XCTFail() }
         catch { XCTAssertTrue((error as? LocalizedError)?.errorDescription?.contains("model not supported") == true) }
     }
+
+    func testInvalidBaseURLFailsCleanlyWithoutCrashing() async {
+        let bad = OpenAICompatClient(baseURL: URL(fileURLWithPath: "/not-http"), apiKey: "k")
+        do { _ = try await bad.models(); XCTFail() }
+        catch { XCTAssertTrue((error as? LocalizedError)?.errorDescription?.contains("接口地址格式无效") == true) }
+        do { for try await _ in bad.chat(model: OllamaModel(name: "x", thinking: false), messages: []) {}; XCTFail() }
+        catch { XCTAssertTrue((error as? LocalizedError)?.errorDescription?.contains("接口地址格式无效") == true) }
+    }
 }
