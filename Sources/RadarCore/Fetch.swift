@@ -328,7 +328,7 @@ public final class Fetcher {
 
     func fetchPage(_ urlString: String, selector: String?, cond: [String: String]) async throws -> FetchResult {
         guard let url = URL(string: urlString) else { throw RadarError.parse("无效地址") }
-        let r = try await get(url, headers: cond)
+        let r = try await get(url, headers: cond, maxBytes: 15_000_000)   // long single-page changelogs (Codex / Claude Code) exceed 5 MB
         if r.status == 304 { return FetchResult(entries: [], notModified: true, etag: cond["If-None-Match"], lastModified: cond["If-Modified-Since"]) }
         try check(r, allow304: true)
         var res = try extractPage(html: String(decoding: r.data, as: UTF8.self), url: r.url, selector: selector)
@@ -436,7 +436,7 @@ public final class Fetcher {
 
     func fetchList(_ urlString: String, cond: [String: String]) async throws -> FetchResult {
         guard let url = URL(string: urlString) else { throw RadarError.parse("无效地址") }
-        let r = try await get(url, headers: cond)
+        let r = try await get(url, headers: cond, maxBytes: 10_000_000)
         if r.status == 304 { return FetchResult(entries: [], notModified: true, etag: cond["If-None-Match"], lastModified: cond["If-Modified-Since"]) }
         try check(r, allow304: true)
         var res = try extractList(html: String(decoding: r.data, as: UTF8.self), url: r.url)
